@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+ENV/
+.env
+
+# 数据/表格（避免误推送）
+*.xlsx
+*.xls
+*.csv
+*.parquet
+*.db
+
+# Streamlit
+.streamlit/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
