@@ -28,3 +28,13 @@
 
 - UI输出的是“企业微信消息文本”，可直接复制粘贴
 - 若某指标非当日取数，会显示类似：`（2026.01.13投料批次DA2601-080~DA2601-087）`
+
+## 5. 使用 GitHub 工作流打包 exe
+
+仓库已提供 GitHub Actions 工作流：`.github/workflows/build-windows-exe.yml`。
+
+- 打包产物：
+  - `daily_wecom_report.exe`：命令行版
+  - `wecom_report_ui`：UI 版（文件夹形式，运行其中的 `wecom_report_ui.exe`）
+- 触发方式：在 GitHub 页面 `Actions` → `build-windows-exe` → `Run workflow`
+- 下载方式：工作流完成后在 `Artifacts` 下载 `windows-exe`
