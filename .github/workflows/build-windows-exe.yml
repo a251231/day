@@ -35,7 +35,8 @@ jobs:
           pyinstaller --noconfirm --clean --paths . --onedir -n wecom_report_ui packaging/ui_entry.py ^
             --add-data "wecom_report_ui.py;." ^
             --add-data "UI使用说明.md;." ^
-            --add-data "daily_wecom_report.py;."
+            --add-data "daily_wecom_report.py;." ^
+            --collect-all streamlit
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

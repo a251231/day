@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+import socket
 
 
 def _resource_path(rel: str) -> str:
@@ -25,6 +26,21 @@ def main() -> int:
         print(f"找不到UI脚本：{ui_script}", file=sys.stderr)
         return 2
 
+    # 避免 8501 端口被占用导致双击“闪退”：在 8501~8600 里选一个可用端口
+    port = None
+    for candidate in range(8501, 8601):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", candidate))
+            except OSError:
+                continue
+            port = candidate
+            break
+    if port is None:
+        print("未找到可用端口（8501~8600），请关闭占用端口的程序后重试。", file=sys.stderr)
+        return 3
+
     # 等价于：python -m streamlit run wecom_report_ui.py
     from streamlit.web import cli as stcli
 
@@ -32,6 +48,9 @@ def main() -> int:
         "streamlit",
         "run",
         ui_script,
+        "--global.developmentMode=false",
+        f"--server.port={port}",
+        "--server.address=127.0.0.1",
         "--server.headless=false",
         "--browser.gatherUsageStats=false",
     ]

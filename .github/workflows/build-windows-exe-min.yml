@@ -46,6 +46,7 @@ jobs:
             --add-data "wecom_report_ui.py;." `
             --add-data "UI使用说明.md;." `
             --add-data "daily_wecom_report.py;." `
+            --collect-all streamlit `
             --exclude-module scipy `
             --exclude-module sklearn `
             --exclude-module skimage `
@@ -64,4 +65,3 @@ jobs:
           path: |
             dist/daily_wecom_report.exe
             dist/wecom_report_ui/**
-

@@ -46,3 +46,11 @@
 - 触发方式：`Actions` → `build-windows-exe-min` → `Run workflow`
 - 产物：`Artifacts` → `windows-exe-min`
 - 说明：CLI/UI 会在各自独立 venv 内构建，避免把 runner/环境里无关的大依赖打进包里；同时通过 `--exclude-module` 排除常见无关模块。
+
+### 打包 exe “闪退”排查
+
+如果你是双击 `wecom_report_ui.exe` 后一闪而过，常见原因是 **8501 端口被占用** 或 **打包缺少 Streamlit 元数据/静态资源**。
+
+- 建议：用命令行启动查看报错（不会一闪而过）
+  - `dist\\wecom_report_ui\\wecom_report_ui.exe`
+- 当前打包入口已自动在 `8501~8600` 里选择可用端口，并强制关闭 `global.developmentMode`，避免跳转到 `3000` 端口。
