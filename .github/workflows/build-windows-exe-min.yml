@@ -1,0 +1,67 @@
+name: build-windows-exe-min
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build CLI (minimal venv)
+        shell: pwsh
+        run: |
+          python -m venv .venv_cli
+          .\.venv_cli\Scripts\python -m pip install --upgrade pip
+          .\.venv_cli\Scripts\pip install --no-cache-dir -r requirements-cli.txt pyinstaller
+
+          .\.venv_cli\Scripts\pyinstaller --noconfirm --clean --paths . --onefile -n daily_wecom_report packaging/cli_entry.py `
+            --exclude-module scipy `
+            --exclude-module sklearn `
+            --exclude-module skimage `
+            --exclude-module matplotlib `
+            --exclude-module PyQt5 `
+            --exclude-module PySide6 `
+            --exclude-module IPython `
+            --exclude-module notebook `
+            --exclude-module jupyter `
+            --exclude-module pytest
+
+      - name: Build UI (minimal venv)
+        shell: pwsh
+        run: |
+          python -m venv .venv_ui
+          .\.venv_ui\Scripts\python -m pip install --upgrade pip
+          .\.venv_ui\Scripts\pip install --no-cache-dir -r requirements-ui.txt pyinstaller
+
+          .\.venv_ui\Scripts\pyinstaller --noconfirm --clean --paths . --onedir -n wecom_report_ui packaging/ui_entry.py `
+            --add-data "wecom_report_ui.py;." `
+            --add-data "UI使用说明.md;." `
+            --add-data "daily_wecom_report.py;." `
+            --exclude-module scipy `
+            --exclude-module sklearn `
+            --exclude-module skimage `
+            --exclude-module matplotlib `
+            --exclude-module PyQt5 `
+            --exclude-module PySide6 `
+            --exclude-module IPython `
+            --exclude-module notebook `
+            --exclude-module jupyter `
+            --exclude-module pytest
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe-min
+          path: |
+            dist/daily_wecom_report.exe
+            dist/wecom_report_ui/**
+

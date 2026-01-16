@@ -38,3 +38,11 @@
   - `wecom_report_ui`：UI 版（文件夹形式，运行其中的 `wecom_report_ui.exe`）
 - 触发方式：在 GitHub 页面 `Actions` → `build-windows-exe` → `Run workflow`
 - 下载方式：工作流完成后在 `Artifacts` 下载 `windows-exe`
+
+### 体积更小的打包（推荐）
+
+如果你发现 exe 很大，可以使用“最小依赖 venv + 排除项”的工作流：`.github/workflows/build-windows-exe-min.yml`。
+
+- 触发方式：`Actions` → `build-windows-exe-min` → `Run workflow`
+- 产物：`Artifacts` → `windows-exe-min`
+- 说明：CLI/UI 会在各自独立 venv 内构建，避免把 runner/环境里无关的大依赖打进包里；同时通过 `--exclude-module` 排除常见无关模块。
