@@ -6,10 +6,13 @@ services:
     volumes:
       - ./:/app
     ports:
-      - "8501:8501"
+      - "0.0.0.0:8501:8501"
+    environment:
+      WE_COM_REPORT_UI_LAUNCHER: "1"
     command: >
       bash -lc "pip install -r requirements.txt
       && streamlit run wecom_report_ui.py
       --server.address=0.0.0.0
       --server.port=8501
-      --server.headless=true"
+      --server.headless=true
+      --browser.gatherUsageStats=false"

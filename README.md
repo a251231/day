@@ -58,6 +58,11 @@ docker compose up
 访问：`http://<宿主机IP>:8501`
 
 > Compose 已挂载当前目录，UI 的“选择本地文件”可直接看到宿主机目录下的 Excel。
+> 如果宿主机能访问但内网设备访问不到，请放行 Windows 防火墙 8501 入站（TCP）：
+
+```powershell
+netsh advfirewall firewall add rule name="Streamlit 8501" dir=in action=allow protocol=TCP localport=8501
+```
 
 ## 说明文档
 
