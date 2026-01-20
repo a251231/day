@@ -15,6 +15,17 @@
 
 `python -m streamlit run wecom_report_ui.py`
 
+## 2.1 局域网访问（可选）
+
+如果希望同一局域网其他电脑访问：
+
+- 推荐：`python wecom_report_ui.py` 启动（已默认绑定 `0.0.0.0`）
+- 或：`streamlit run wecom_report_ui.py --server.address=0.0.0.0 --server.port=8501`
+
+访问地址：`http://<本机局域网IP>:8501`，并确保防火墙放行 8501 端口。
+
+如需只允许本机访问，可设置环境变量 `WE_COM_REPORT_UI_BIND=127.0.0.1` 后再启动。
+
 ## 3. 使用方式
 
 - Excel来源：支持“选择本地文件”或“上传文件”

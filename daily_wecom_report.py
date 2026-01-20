@@ -58,7 +58,7 @@ def _sanitize_col(name: str) -> str:
     return re.sub(r"\s+", "", name).strip()
 
 
-_BATCH_RE = re.compile(r"^(DA|DB)\d{4}-\d{3}$")
+_BATCH_RE = re.compile(r"^(?:D?A|D?B)\d{4}-\d{3}$")
 
 
 def _find_row_contains(df: pd.DataFrame, keyword: str, max_rows: int = 80) -> Optional[int]:
@@ -332,7 +332,10 @@ def _latest_stat_within_days(df: pd.DataFrame, cols: list[str], report_date: dt.
 
 
 def extract_metrics(df: pd.DataFrame, report_date: dt.date, lookback_days: int) -> dict[str, Any]:
-    day = df[df.get("投料日期") == report_date].copy()
+    if "投料日期" in df.columns:
+        day = df[df["投料日期"] == report_date].copy()
+    else:
+        day = df.head(0).copy()
 
     # 注意：很多表会出现“均值未填，但B1-1/B1-2/B1-3已填”的情况，因此这里不只取“均值”
     sinter_cols = [c for c in df.columns if "烧结压实" in c]

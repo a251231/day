@@ -1,0 +1,15 @@
+version: "3.9"
+services:
+  wecom-report-ui:
+    image: python:3.10-slim
+    working_dir: /app
+    volumes:
+      - ./:/app
+    ports:
+      - "8501:8501"
+    command: >
+      bash -lc "pip install -r requirements.txt
+      && streamlit run wecom_report_ui.py
+      --server.address=0.0.0.0
+      --server.port=8501
+      --server.headless=true"

@@ -32,6 +32,24 @@ def _save_upload_to_temp(upload) -> str:
         return f.name
 
 
+def _cleanup_temp_file(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _upload_signature(upload) -> tuple[str, int]:
+    size = getattr(upload, "size", None)
+    if size is None:
+        size = len(upload.getbuffer())
+    return (upload.name, int(size))
+
+
 def _date_to_str(d: Optional[pd.Timestamp | object]) -> Optional[str]:
     if d is None:
         return None
@@ -53,7 +71,12 @@ def _running_under_streamlit() -> bool:
 def _launch_with_streamlit() -> int:
     env = dict(os.environ)
     env["WE_COM_REPORT_UI_LAUNCHER"] = "1"
-    return subprocess.call([sys.executable, "-m", "streamlit", "run", str(Path(__file__).resolve())], env=env)
+    address = env.get("WE_COM_REPORT_UI_BIND", "0.0.0.0")
+    port = env.get("WE_COM_REPORT_UI_PORT")
+    cmd = [sys.executable, "-m", "streamlit", "run", str(Path(__file__).resolve()), f"--server.address={address}"]
+    if port:
+        cmd.append(f"--server.port={port}")
+    return subprocess.call(cmd, env=env)
 
 
 def main() -> None:
@@ -92,8 +115,21 @@ def main() -> None:
         else:
             upload = st.file_uploader("上传Excel（.xlsx）", type=["xlsx"])
             if upload is not None:
-                excel_path = _save_upload_to_temp(upload)
-                st.success(f"已接收：{upload.name}")
+                temp_path = st.session_state.get("temp_upload_path")
+                temp_sig = st.session_state.get("temp_upload_sig")
+                current_sig = _upload_signature(upload)
+                if temp_sig != current_sig or not temp_path or not Path(temp_path).exists():
+                    excel_path = _save_upload_to_temp(upload)
+                    _cleanup_temp_file(temp_path)
+                    st.session_state["temp_upload_path"] = excel_path
+                    st.session_state["temp_upload_sig"] = current_sig
+                    st.success(f"已接收：{upload.name}")
+                else:
+                    excel_path = temp_path
+            else:
+                temp_path = st.session_state.get("temp_upload_path")
+                if temp_path and Path(temp_path).exists():
+                    excel_path = temp_path
 
         date_arg: Optional[str] = None
         available_dates: list[dt.date] = []

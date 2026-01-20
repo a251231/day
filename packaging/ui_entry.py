@@ -26,13 +26,15 @@ def main() -> int:
         print(f"找不到UI脚本：{ui_script}", file=sys.stderr)
         return 2
 
+    address = os.environ.get("WE_COM_REPORT_UI_BIND", "0.0.0.0")
+
     # 避免 8501 端口被占用导致双击“闪退”：在 8501~8600 里选一个可用端口
     port = None
     for candidate in range(8501, 8601):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                s.bind(("127.0.0.1", candidate))
+                s.bind((address, candidate))
             except OSError:
                 continue
             port = candidate
@@ -50,7 +52,7 @@ def main() -> int:
         ui_script,
         "--global.developmentMode=false",
         f"--server.port={port}",
-        "--server.address=127.0.0.1",
+        f"--server.address={address}",
         "--server.headless=false",
         "--browser.gatherUsageStats=false",
     ]
