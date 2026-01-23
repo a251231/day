@@ -61,6 +61,12 @@ def _sanitize_col(name: str) -> str:
 _BATCH_RE = re.compile(r"^(?:D?A|D?B)\d{4}-\d{3}$")
 
 
+def _col_contains(col: str, token: str) -> bool:
+    norm_col = _sanitize_col(col).replace("＋", "+")
+    norm_token = _sanitize_col(token).replace("＋", "+")
+    return (token in col) or (norm_token in norm_col)
+
+
 def _find_row_contains(df: pd.DataFrame, keyword: str, max_rows: int = 80) -> Optional[int]:
     for i in range(min(len(df), max_rows)):
         row = df.iloc[i].astype(str)
@@ -223,7 +229,7 @@ def _has_any_metric_data(df: pd.DataFrame, date_: dt.date) -> bool:
         "粉末电阻",
         "碳含量",
         "麦克比表",
-        "Na+K含量",
+        "Li+含量",
         "扣电_0.1C充",
         "扣电_0.1C放",
         "扣电_0.1C首效",
@@ -231,7 +237,10 @@ def _has_any_metric_data(df: pd.DataFrame, date_: dt.date) -> bool:
         "粉碎压实",
     ]
     for pat in patterns:
-        cols = [c for c in df.columns if (pat in c) or c.startswith(pat)]
+        if "+" in pat or "＋" in pat:
+            cols = [c for c in df.columns if _col_contains(c, pat)]
+        else:
+            cols = [c for c in df.columns if (pat in c) or c.startswith(pat)]
         values = _flatten_numeric_values(day, cols)
         if not values.empty:
             return True
@@ -258,12 +267,20 @@ def pick_date(df_a: pd.DataFrame, df_b: pd.DataFrame, date_arg: Optional[str]) -
     return max(dates)
 
 
-def _stat_for_cols(day: pd.DataFrame, cols: list[str]) -> dict[str, Any]:
+def _stat_for_cols(day: pd.DataFrame, cols: list[str], scale: float = 1.0) -> dict[str, Any]:
     values = _flatten_numeric_values(day, cols)
+    if scale != 1.0:
+        values = values * scale
     st = _range_stat(values)
     if st is None:
         return {"有数据": False}
     spec = parse_spec_from_colname(cols[0]) if cols else None
+    if spec is not None and scale != 1.0:
+        spec = Spec(
+            lower=None if spec.lower is None else spec.lower * scale,
+            upper=None if spec.upper is None else spec.upper * scale,
+            text=spec.text,
+        )
     judge = judge_out_of_spec(values, spec)
     return {
         "有数据": True,
@@ -315,14 +332,16 @@ def _batch_summary_for_day(day: pd.DataFrame, cols: list[str]) -> str:
     return _summarize_batches(batches)
 
 
-def _latest_stat_within_days(df: pd.DataFrame, cols: list[str], report_date: dt.date, lookback_days: int) -> dict[str, Any]:
+def _latest_stat_within_days(
+    df: pd.DataFrame, cols: list[str], report_date: dt.date, lookback_days: int, scale: float = 1.0
+) -> dict[str, Any]:
     if "投料日期" not in df.columns:
         return {"有数据": False}
 
     for delta in range(0, max(0, lookback_days) + 1):
         d = report_date - dt.timedelta(days=delta)
         day = df[df["投料日期"] == d]
-        st = _stat_for_cols(day, cols)
+        st = _stat_for_cols(day, cols, scale=scale)
         if st.get("有数据"):
             st["来源日期"] = d
             st["是否当日"] = (delta == 0)
@@ -343,7 +362,7 @@ def extract_metrics(df: pd.DataFrame, report_date: dt.date, lookback_days: int) 
 
     prod_density_cols = [c for c in df.columns if "成品压实" in c]
     powder_res_cols = [c for c in df.columns if "粉末电阻" in c]
-    alkali_cols = [c for c in df.columns if "Na+K含量" in c]
+    li_cols = [c for c in df.columns if _col_contains(c, "Li+含量")]
     carbon_cols = [c for c in df.columns if c.startswith("碳含量")]
     bet_cols = [c for c in df.columns if "麦克比表" in c]
 
@@ -363,7 +382,7 @@ def extract_metrics(df: pd.DataFrame, report_date: dt.date, lookback_days: int) 
             "0.1C放电": _latest_stat_within_days(df, discharge_cols, report_date, lookback_days),
             "首效": _latest_stat_within_days(df, eff_cols, report_date, lookback_days),
             "平台效率": _latest_stat_within_days(df, plat_cols, report_date, lookback_days),
-            "残碱(Na+K)": _latest_stat_within_days(df, alkali_cols, report_date, lookback_days),
+            "残碱(Li+)": _latest_stat_within_days(df, li_cols, report_date, lookback_days, scale=10000),
             "碳含量": _latest_stat_within_days(df, carbon_cols, report_date, lookback_days),
             "粉阻(粉末电阻)": _latest_stat_within_days(df, powder_res_cols, report_date, lookback_days),
             "比表(麦克)": _latest_stat_within_days(df, bet_cols, report_date, lookback_days),
@@ -468,7 +487,7 @@ def build_wecom_text(report_date: dt.date, a: dict[str, Any], b: dict[str, Any])
     b_eff = _fmt_metric(b["成品"]["首效"], 2)
     b_plat = _fmt_metric(b["成品"]["平台效率"], 1)
 
-    ab_alkali = _fmt_range(_merge_stats(a["成品"]["残碱(Na+K)"], b["成品"]["残碱(Na+K)"]), 0)
+    ab_alkali = _fmt_range(_merge_stats(a["成品"]["残碱(Li+)"], b["成品"]["残碱(Li+)"]), 0)
     a_carbon = _fmt_metric(a["成品"]["碳含量"], 2)
     b_carbon = _fmt_metric(b["成品"]["碳含量"], 2)
     a_powder_r = _fmt_metric(a["成品"]["粉阻(粉末电阻)"], 1)
@@ -489,7 +508,7 @@ def build_wecom_text(report_date: dt.date, a: dict[str, Any], b: dict[str, Any])
     lines.append(f"  ①AB线成品压实：{ab_prod_density}。")
     lines.append(f"  ②A线0.1C充电：{a_charge}；0.1C放电：{a_discharge}；首效：{a_eff}；平台效率：{a_plat}。")
     lines.append(f"  ③B线0.1C充电：{b_charge}；0.1C放电：{b_discharge}；首效：{b_eff}；平台效率：{b_plat}。")
-    lines.append(f"  ④AB线残碱(Na+K)：{_with_unit(ab_alkali, 'ppm')}。")
+    lines.append(f"  ④AB线残碱(Li+)：{_with_unit(ab_alkali, 'ppm')}。")
     lines.append(f"  ⑤碳含量：A线 {a_carbon}；B线 {b_carbon}。")
     lines.append(f"  ⑥粉阻(粉末电阻)：A线 {a_powder_r}；B线 {b_powder_r}。")
     lines.append(f"  ⑦比表(麦克)：A线 {a_bet}；B线 {b_bet}。")
