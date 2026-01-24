@@ -130,8 +130,36 @@ def load_sheet_table(path: str, sheet_name: str) -> pd.DataFrame:
     return df
 
 
+def _parse_num(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    parts = text.split("/")
+    nums: list[float] = []
+    for part in parts:
+        cleaned = (
+            part.replace("≤", "")
+            .replace("≥", "")
+            .replace("＋", "+")
+            .replace("%", "")
+            .strip()
+        )
+        m = re.search(r"[-+]?\d+(?:\.\d+)?", cleaned)
+        if m:
+            nums.append(float(m.group(0)))
+    if not nums:
+        return None
+    return float(sum(nums) / len(nums))
+
+
 def _to_num_series(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce")
+    return s.apply(_parse_num)
 
 
 def _flatten_numeric_values(df: pd.DataFrame, cols: list[str]) -> pd.Series:
@@ -322,7 +350,7 @@ def _batch_summary_for_day(day: pd.DataFrame, cols: list[str]) -> str:
 
     has_value = pd.Series(False, index=day.index)
     for c in metric_cols:
-        s = pd.to_numeric(day[c], errors="coerce")
+        s = _to_num_series(day[c])
         has_value = has_value | s.notna()
 
     if not has_value.any():
@@ -350,7 +378,68 @@ def _latest_stat_within_days(
     return {"有数据": False}
 
 
-def extract_metrics(df: pd.DataFrame, report_date: dt.date, lookback_days: int) -> dict[str, Any]:
+_LI_PASS_MAX = 500
+_TREND_ANOMALY_RATIO = 1.3
+_LI_TREND_ANOMALY_ABS = 80
+_TREND_MAX_LOOKBACK_DAYS = 60
+
+
+def _trend_for_cols(
+    df: pd.DataFrame,
+    cols: list[str],
+    report_date: dt.date,
+    trend_points: int,
+    max_lookback_days: int,
+    scale: float = 1.0,
+    anomaly_ratio: float = _TREND_ANOMALY_RATIO,
+    anomaly_abs: Optional[float] = None,
+) -> dict[str, Any]:
+    if "投料日期" not in df.columns or not cols or trend_points <= 0:
+        return {"有数据": False, "窗口": trend_points, "点数": 0}
+
+    points: list[tuple[dt.date, dict[str, Any]]] = []
+    for delta in range(0, max_lookback_days + 1):
+        d = report_date - dt.timedelta(days=delta)
+        day = df[df["投料日期"] == d]
+        st = _stat_for_cols(day, cols, scale=scale)
+        if st.get("有数据"):
+            points.append((d, st))
+            if len(points) >= trend_points:
+                break
+
+    if not points:
+        return {"有数据": False, "窗口": trend_points, "点数": 0}
+
+    points = list(reversed(points))
+    means = [p[1]["mean"] for p in points]
+    overall_mean = float(sum(means) / len(means)) if means else float("nan")
+    anomalies: list[dict[str, Any]] = []
+    if overall_mean and not np.isnan(overall_mean):
+        lower = overall_mean / anomaly_ratio if anomaly_ratio > 0 else overall_mean
+        upper = overall_mean * anomaly_ratio
+        for d, st in points:
+            mean = float(st["mean"])
+            if mean < lower or mean > upper or (anomaly_abs is not None and abs(mean - overall_mean) >= anomaly_abs):
+                anomalies.append({"日期": d, "mean": mean})
+
+    direction = "—"
+    if means[-1] > means[0] + 1e-9:
+        direction = "↑"
+    elif means[-1] < means[0] - 1e-9:
+        direction = "↓"
+
+    return {
+        "有数据": True,
+        "窗口": trend_points,
+        "点数": len(points),
+        "日期": [p[0] for p in points],
+        "均值": means,
+        "方向": direction,
+        "异常": anomalies,
+    }
+
+
+def extract_metrics(df: pd.DataFrame, report_date: dt.date, lookback_days: int, trend_days: int = 7) -> dict[str, Any]:
     if "投料日期" in df.columns:
         day = df[df["投料日期"] == report_date].copy()
     else:
@@ -371,10 +460,37 @@ def extract_metrics(df: pd.DataFrame, report_date: dt.date, lookback_days: int) 
     eff_cols = [c for c in df.columns if c.startswith("扣电_0.1C首效")]
     plat_cols = [c for c in df.columns if c.startswith("扣电_3.2V平台效率")]
 
+    trend_lookback_days = max(lookback_days, trend_days * 5, 30)
+
+    def _trend(cols: list[str], scale: float = 1.0, anomaly_abs: Optional[float] = None) -> dict[str, Any]:
+        return _trend_for_cols(
+            df,
+            cols,
+            report_date,
+            trend_days,
+            trend_lookback_days,
+            scale=scale,
+            anomaly_abs=anomaly_abs,
+        )
+
+    li_trend = _trend(li_cols, scale=10000, anomaly_abs=_LI_TREND_ANOMALY_ABS)
+    sinter_trend = _trend(sinter_cols)
+    crush_trend = _trend(crush_cols)
+    prod_density_trend = _trend(prod_density_cols)
+    powder_res_trend = _trend(powder_res_cols)
+    carbon_trend = _trend(carbon_cols)
+    bet_trend = _trend(bet_cols)
+    charge_trend = _trend(charge_cols)
+    discharge_trend = _trend(discharge_cols)
+    eff_trend = _trend(eff_cols)
+    plat_trend = _trend(plat_cols)
+
     return {
         "制程": {
             "烧结压实": _latest_stat_within_days(df, sinter_cols, report_date, lookback_days),
             "粉碎压实": _latest_stat_within_days(df, crush_cols, report_date, lookback_days),
+            "烧结压实趋势": sinter_trend,
+            "粉碎压实趋势": crush_trend,
         },
         "成品": {
             "成品压实": _latest_stat_within_days(df, prod_density_cols, report_date, lookback_days),
@@ -385,7 +501,16 @@ def extract_metrics(df: pd.DataFrame, report_date: dt.date, lookback_days: int) 
             "残碱(Li+)": _latest_stat_within_days(df, li_cols, report_date, lookback_days, scale=10000),
             "碳含量": _latest_stat_within_days(df, carbon_cols, report_date, lookback_days),
             "粉阻(粉末电阻)": _latest_stat_within_days(df, powder_res_cols, report_date, lookback_days),
-            "比表(麦克)": _latest_stat_within_days(df, bet_cols, report_date, lookback_days),
+            "比表(麦克比表)": _latest_stat_within_days(df, bet_cols, report_date, lookback_days),
+            "残碱(Li+)趋势": li_trend,
+            "成品压实趋势": prod_density_trend,
+            "0.1C充电趋势": charge_trend,
+            "0.1C放电趋势": discharge_trend,
+            "首效趋势": eff_trend,
+            "平台效率趋势": plat_trend,
+            "碳含量趋势": carbon_trend,
+            "粉阻(粉末电阻)趋势": powder_res_trend,
+            "比表(麦克比表)趋势": bet_trend,
         },
         "当日行数": int(day.shape[0]),
     }
@@ -458,6 +583,38 @@ def _fmt_metric(stat: dict[str, Any], decimals: int) -> str:
     return _fmt_range(stat, decimals) + _fmt_status(stat) + _fmt_source_date(stat)
 
 
+def _fmt_li_status(stat: dict[str, Any]) -> str:
+    if not stat.get("有数据"):
+        return ""
+    return "（合格）" if float(stat["max"]) < _LI_PASS_MAX else "（超标）"
+
+
+def _fmt_trend(trend: dict[str, Any], decimals: int, unit: str = "") -> str:
+    if not trend.get("有数据"):
+        return "无数据"
+    means = trend.get("均值") or []
+    if not means:
+        return "无数据"
+    fmt = lambda v: f"{v:.{decimals}f}"
+    if len(means) == 1:
+        base = fmt(means[0])
+    else:
+        base = f"{fmt(means[0])}→{fmt(means[-1])}（{trend.get('方向', '—')}）"
+    if unit:
+        base = f"{base}{unit}"
+    anomalies = trend.get("异常") or []
+    if not anomalies:
+        return base
+    first = anomalies[0]
+    date_str = first["日期"].strftime("%Y.%m.%d") if isinstance(first.get("日期"), dt.date) else "未知日期"
+    hint = f"异常：{date_str} {fmt(first['mean'])}"
+    if unit:
+        hint = f"{hint}{unit}"
+    if len(anomalies) > 1:
+        hint += f" 等{len(anomalies)}天"
+    return f"{base}，{hint}"
+
+
 def build_wecom_text(report_date: dt.date, a: dict[str, Any], b: dict[str, Any]) -> str:
     date_str = report_date.strftime("%Y.%m.%d")
 
@@ -472,6 +629,10 @@ def build_wecom_text(report_date: dt.date, a: dict[str, Any], b: dict[str, Any])
     a_crush = _fmt_metric(a_crush_stat, 3)
     b_crush = _fmt_metric(b_crush_stat, 3)
     ab_crush = _fmt_range(_merge_stats(a_crush_stat, b_crush_stat), 3)
+    a_sinter_trend = _fmt_trend(a["制程"]["烧结压实趋势"], 3)
+    b_sinter_trend = _fmt_trend(b["制程"]["烧结压实趋势"], 3)
+    a_crush_trend = _fmt_trend(a["制程"]["粉碎压实趋势"], 3)
+    b_crush_trend = _fmt_trend(b["制程"]["粉碎压实趋势"], 3)
 
     a_prod_density_stat = a["成品"]["成品压实"]
     b_prod_density_stat = b["成品"]["成品压实"]
@@ -487,13 +648,33 @@ def build_wecom_text(report_date: dt.date, a: dict[str, Any], b: dict[str, Any])
     b_eff = _fmt_metric(b["成品"]["首效"], 2)
     b_plat = _fmt_metric(b["成品"]["平台效率"], 1)
 
-    ab_alkali = _fmt_range(_merge_stats(a["成品"]["残碱(Li+)"], b["成品"]["残碱(Li+)"]), 0)
+    ab_alkali_stat = _merge_stats(a["成品"]["残碱(Li+)"], b["成品"]["残碱(Li+)"])
+    ab_alkali = _fmt_range(ab_alkali_stat, 0)
+    ab_alkali_status = _fmt_li_status(ab_alkali_stat)
     a_carbon = _fmt_metric(a["成品"]["碳含量"], 2)
     b_carbon = _fmt_metric(b["成品"]["碳含量"], 2)
     a_powder_r = _fmt_metric(a["成品"]["粉阻(粉末电阻)"], 1)
     b_powder_r = _fmt_metric(b["成品"]["粉阻(粉末电阻)"], 1)
     a_bet = _fmt_metric(a["成品"]["比表(麦克)"], 1)
     b_bet = _fmt_metric(b["成品"]["比表(麦克)"], 1)
+    a_prod_trend = _fmt_trend(a["成品"]["成品压实趋势"], 3)
+    b_prod_trend = _fmt_trend(b["成品"]["成品压实趋势"], 3)
+    a_charge_trend = _fmt_trend(a["成品"]["0.1C充电趋势"], 1)
+    b_charge_trend = _fmt_trend(b["成品"]["0.1C充电趋势"], 1)
+    a_discharge_trend = _fmt_trend(a["成品"]["0.1C放电趋势"], 1)
+    b_discharge_trend = _fmt_trend(b["成品"]["0.1C放电趋势"], 1)
+    a_eff_trend = _fmt_trend(a["成品"]["首效趋势"], 2)
+    b_eff_trend = _fmt_trend(b["成品"]["首效趋势"], 2)
+    a_plat_trend = _fmt_trend(a["成品"]["平台效率趋势"], 1)
+    b_plat_trend = _fmt_trend(b["成品"]["平台效率趋势"], 1)
+    a_li_trend = _fmt_trend(a["成品"]["残碱(Li+)趋势"], 0, unit="ppm")
+    b_li_trend = _fmt_trend(b["成品"]["残碱(Li+)趋势"], 0, unit="ppm")
+    a_carbon_trend = _fmt_trend(a["成品"]["碳含量趋势"], 2)
+    b_carbon_trend = _fmt_trend(b["成品"]["碳含量趋势"], 2)
+    a_powder_trend = _fmt_trend(a["成品"]["粉阻(粉末电阻)趋势"], 1)
+    b_powder_trend = _fmt_trend(b["成品"]["粉阻(粉末电阻)趋势"], 1)
+    a_bet_trend = _fmt_trend(a["成品"]["比表(麦克)趋势"], 1)
+    b_bet_trend = _fmt_trend(b["成品"]["比表(麦克)趋势"], 1)
 
     # 输出结构按你给的 1~6 段落口径；未提供的数据先保留占位，便于你后续把“第二张表”接进来。
     lines: list[str] = []
@@ -504,14 +685,39 @@ def build_wecom_text(report_date: dt.date, a: dict[str, Any], b: dict[str, Any])
         f"3、制程：烧结压实(AB) {ab_sinter}；A线 {a_sinter}；B线 {b_sinter}。"
         f"粉碎压实(AB) {ab_crush}；A线 {a_crush}；B线 {b_crush}。"
     )
+    trend_points = max(a["制程"]["烧结压实趋势"].get("点数", 0), b["制程"]["烧结压实趋势"].get("点数", 0))
+    trend_window = max(a["制程"]["烧结压实趋势"].get("窗口", 0), b["制程"]["烧结压实趋势"].get("窗口", 0))
+    if trend_points:
+        label = f"近{trend_points}次有数均值"
+        if trend_window and trend_points < trend_window:
+            label = f"{label}（不足{trend_window}次）"
+        lines.append(f"  制程趋势（{label}）：")
+        lines.append(f"    烧结压实 A线 {a_sinter_trend}；B线 {b_sinter_trend}。")
+        lines.append(f"    粉碎压实 A线 {a_crush_trend}；B线 {b_crush_trend}。")
     lines.append("4、成品：")
     lines.append(f"  ①AB线成品压实：{ab_prod_density}。")
     lines.append(f"  ②A线0.1C充电：{a_charge}；0.1C放电：{a_discharge}；首效：{a_eff}；平台效率：{a_plat}。")
     lines.append(f"  ③B线0.1C充电：{b_charge}；0.1C放电：{b_discharge}；首效：{b_eff}；平台效率：{b_plat}。")
-    lines.append(f"  ④AB线残碱(Li+)：{_with_unit(ab_alkali, 'ppm')}。")
+    lines.append(f"  ④AB线残碱(Li+)：{_with_unit(ab_alkali, 'ppm')}{ab_alkali_status}。")
     lines.append(f"  ⑤碳含量：A线 {a_carbon}；B线 {b_carbon}。")
     lines.append(f"  ⑥粉阻(粉末电阻)：A线 {a_powder_r}；B线 {b_powder_r}。")
     lines.append(f"  ⑦比表(麦克)：A线 {a_bet}；B线 {b_bet}。")
+    trend_points = max(a["成品"]["残碱(Li+)趋势"].get("点数", 0), b["成品"]["残碱(Li+)趋势"].get("点数", 0))
+    trend_window = max(a["成品"]["残碱(Li+)趋势"].get("窗口", 0), b["成品"]["残碱(Li+)趋势"].get("窗口", 0))
+    if trend_points:
+        label = f"近{trend_points}次有数均值"
+        if trend_window and trend_points < trend_window:
+            label = f"{label}（不足{trend_window}次）"
+        lines.append(f"  成品趋势（{label}）：")
+        lines.append(f"    成品压实 A线 {a_prod_trend}；B线 {b_prod_trend}。")
+        lines.append(f"    0.1C充电 A线 {a_charge_trend}；B线 {b_charge_trend}。")
+        lines.append(f"    0.1C放电 A线 {a_discharge_trend}；B线 {b_discharge_trend}。")
+        lines.append(f"    首效 A线 {a_eff_trend}；B线 {b_eff_trend}。")
+        lines.append(f"    平台效率 A线 {a_plat_trend}；B线 {b_plat_trend}。")
+        lines.append(f"    残碱(Li+) A线 {a_li_trend}；B线 {b_li_trend}。")
+        lines.append(f"    碳含量 A线 {a_carbon_trend}；B线 {b_carbon_trend}。")
+        lines.append(f"    粉阻(粉末电阻) A线 {a_powder_trend}；B线 {b_powder_trend}。")
+        lines.append(f"    比表(麦克) A线 {a_bet_trend}；B线 {b_bet_trend}。")
     lines.append("5、下一步计划：本次Excel未包含（可从模板/手工输入/第二张表接入）")
     lines.append("6、工艺验证：本次Excel未包含（待接入第二张表/Sheet）")
     return "\n".join(lines)
@@ -524,6 +730,7 @@ def main() -> int:
     parser.add_argument("--excel", default=None, help="Excel路径；默认匹配当前目录下 2026*.xlsx")
     parser.add_argument("--date", default=None, help="日期：YYYY-MM-DD；默认取表内最新投料日期")
     parser.add_argument("--lookback-days", type=int, default=7, help="指标取数向前回溯天数（避免当日某列为空显示“未录入”）")
+    parser.add_argument("--trend-days", type=int, default=7, help="趋势窗口（近N次有数）")
     parser.add_argument("--out", default=None, help="输出到文件（UTF-8）；不填则打印到控制台")
     args = parser.parse_args()
 
@@ -539,8 +746,8 @@ def main() -> int:
     df_b = load_sheet_table(path, "B线")
 
     report_date = pick_date(df_a, df_b, args.date)
-    a = extract_metrics(df_a, report_date, args.lookback_days)
-    b = extract_metrics(df_b, report_date, args.lookback_days)
+    a = extract_metrics(df_a, report_date, args.lookback_days, args.trend_days)
+    b = extract_metrics(df_b, report_date, args.lookback_days, args.trend_days)
     text = build_wecom_text(report_date, a, b)
 
     if args.out:

@@ -167,6 +167,7 @@ def main() -> None:
             date_arg = _date_to_str(d)
 
         lookback_days = int(st.slider("回溯天数（用于避免当日某列为空）", min_value=0, max_value=30, value=7, step=1))
+        trend_days = int(st.slider("趋势窗口（近N次有数）", min_value=3, max_value=30, value=7, step=1))
 
         generate = st.button("生成日报", type="primary", use_container_width=True, disabled=(excel_path is None))
 
@@ -181,8 +182,8 @@ def main() -> None:
         df_b = core.load_sheet_table(excel_path, "B线")
 
         report_date = core.pick_date(df_a, df_b, date_arg)
-        metrics_a = core.extract_metrics(df_a, report_date, lookback_days)
-        metrics_b = core.extract_metrics(df_b, report_date, lookback_days)
+        metrics_a = core.extract_metrics(df_a, report_date, lookback_days, trend_days)
+        metrics_b = core.extract_metrics(df_b, report_date, lookback_days, trend_days)
         text = core.build_wecom_text(report_date, metrics_a, metrics_b)
 
     except Exception as e:
@@ -198,7 +199,7 @@ def main() -> None:
 
     with col2:
         st.subheader("参数")
-        st.write({"日期": report_date.isoformat(), "回溯天数": lookback_days})
+        st.write({"日期": report_date.isoformat(), "回溯天数": lookback_days, "趋势窗口": trend_days})
         st.subheader("提示")
         st.write("如果某指标当日未出数，会自动向前回溯到最近一次有数的“投料批次”，并在括号中标注。")
 
