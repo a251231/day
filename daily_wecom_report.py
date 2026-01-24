@@ -461,6 +461,7 @@ def extract_metrics(df: pd.DataFrame, report_date: dt.date, lookback_days: int, 
     plat_cols = [c for c in df.columns if c.startswith("扣电_3.2V平台效率")]
 
     trend_lookback_days = max(lookback_days, trend_days * 5, 30)
+    trend_lookback_days = min(trend_lookback_days, _TREND_MAX_LOOKBACK_DAYS)
 
     def _trend(cols: list[str], scale: float = 1.0, anomaly_abs: Optional[float] = None) -> dict[str, Any]:
         return _trend_for_cols(
@@ -589,6 +590,23 @@ def _fmt_li_status(stat: dict[str, Any]) -> str:
     return "（合格）" if float(stat["max"]) < _LI_PASS_MAX else "（超标）"
 
 
+def _trend_sparkline(values: list[float]) -> str:
+    if not values:
+        return ""
+    levels = "▁▂▃▄▅▆▇█"
+    vmin = min(values)
+    vmax = max(values)
+    if vmin == vmax:
+        return levels[0] * len(values)
+    span = vmax - vmin
+    chars: list[str] = []
+    for v in values:
+        idx = int(round((v - vmin) / span * (len(levels) - 1)))
+        idx = max(0, min(len(levels) - 1, idx))
+        chars.append(levels[idx])
+    return "".join(chars)
+
+
 def _fmt_trend(trend: dict[str, Any], decimals: int, unit: str = "") -> str:
     if not trend.get("有数据"):
         return "无数据"
@@ -596,10 +614,9 @@ def _fmt_trend(trend: dict[str, Any], decimals: int, unit: str = "") -> str:
     if not means:
         return "无数据"
     fmt = lambda v: f"{v:.{decimals}f}"
-    if len(means) == 1:
-        base = fmt(means[0])
-    else:
-        base = f"{fmt(means[0])}→{fmt(means[-1])}（{trend.get('方向', '—')}）"
+    seq = ",".join(fmt(v) for v in means)
+    spark = _trend_sparkline(means)
+    base = f"{seq} / {spark}（{trend.get('方向', '—')}）"
     if unit:
         base = f"{base}{unit}"
     anomalies = trend.get("异常") or []
@@ -688,9 +705,9 @@ def build_wecom_text(report_date: dt.date, a: dict[str, Any], b: dict[str, Any])
     trend_points = max(a["制程"]["烧结压实趋势"].get("点数", 0), b["制程"]["烧结压实趋势"].get("点数", 0))
     trend_window = max(a["制程"]["烧结压实趋势"].get("窗口", 0), b["制程"]["烧结压实趋势"].get("窗口", 0))
     if trend_points:
-        label = f"近{trend_points}次有数均值"
+        label = f"近{trend_points}个有数日均值"
         if trend_window and trend_points < trend_window:
-            label = f"{label}（不足{trend_window}次）"
+            label = f"{label}（不足{trend_window}个有数日）"
         lines.append(f"  制程趋势（{label}）：")
         lines.append(f"    烧结压实 A线 {a_sinter_trend}；B线 {b_sinter_trend}。")
         lines.append(f"    粉碎压实 A线 {a_crush_trend}；B线 {b_crush_trend}。")
@@ -705,9 +722,9 @@ def build_wecom_text(report_date: dt.date, a: dict[str, Any], b: dict[str, Any])
     trend_points = max(a["成品"]["残碱(Li+)趋势"].get("点数", 0), b["成品"]["残碱(Li+)趋势"].get("点数", 0))
     trend_window = max(a["成品"]["残碱(Li+)趋势"].get("窗口", 0), b["成品"]["残碱(Li+)趋势"].get("窗口", 0))
     if trend_points:
-        label = f"近{trend_points}次有数均值"
+        label = f"近{trend_points}个有数日均值"
         if trend_window and trend_points < trend_window:
-            label = f"{label}（不足{trend_window}次）"
+            label = f"{label}（不足{trend_window}个有数日）"
         lines.append(f"  成品趋势（{label}）：")
         lines.append(f"    成品压实 A线 {a_prod_trend}；B线 {b_prod_trend}。")
         lines.append(f"    0.1C充电 A线 {a_charge_trend}；B线 {b_charge_trend}。")
