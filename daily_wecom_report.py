@@ -382,6 +382,9 @@ _LI_PASS_MAX = 500
 _TREND_ANOMALY_RATIO = 1.3
 _LI_TREND_ANOMALY_ABS = 80
 _TREND_MAX_LOOKBACK_DAYS = 60
+_TREND_SIGNIFICANT_REL = 0.005
+_TREND_SIGNIFICANT_REL_LI = 0.02
+_TREND_SIGNIFICANT_ABS_LI = 10.0
 
 
 def _trend_for_cols(
@@ -553,9 +556,11 @@ def _fmt_range(stat: dict[str, Any], decimals: int = 3) -> str:
     return f"{mn:.{decimals}f}-{mx:.{decimals}f}"
 
 
-def _fmt_status(stat: dict[str, Any]) -> str:
+def _fmt_status(stat: dict[str, Any], force: bool = False) -> str:
     judge = stat.get("判异") if isinstance(stat, dict) else None
     if not isinstance(judge, dict):
+        if force and stat.get("有数据"):
+            return "（未设定口径）"
         return ""
     abnormal = judge.get("异常")
     if abnormal is True:
@@ -580,8 +585,8 @@ def _with_unit(value: str, unit: str) -> str:
     return value if value == "未找到有效数据" else f"{value}{unit}"
 
 
-def _fmt_metric(stat: dict[str, Any], decimals: int) -> str:
-    return _fmt_range(stat, decimals) + _fmt_status(stat) + _fmt_source_date(stat)
+def _fmt_metric(stat: dict[str, Any], decimals: int, force_status: bool = False) -> str:
+    return _fmt_range(stat, decimals) + _fmt_status(stat, force=force_status) + _fmt_source_date(stat)
 
 
 def _fmt_li_status(stat: dict[str, Any]) -> str:
@@ -607,6 +612,72 @@ def _trend_sparkline(values: list[float]) -> str:
     return "".join(chars)
 
 
+def _fmt_trend_dates(trend: dict[str, Any]) -> str:
+    dates = trend.get("日期") or []
+    if not dates:
+        return ""
+    sorted_dates = sorted([d for d in dates if isinstance(d, dt.date)])
+    if not sorted_dates:
+        return ""
+    is_continuous = all(
+        (sorted_dates[i] - sorted_dates[i - 1]).days == 1 for i in range(1, len(sorted_dates))
+    )
+    if is_continuous:
+        if len(sorted_dates) == 1:
+            return sorted_dates[0].strftime("%m.%d")
+        return f"{sorted_dates[0].strftime('%m.%d')}-{sorted_dates[-1].strftime('%m.%d')}"
+    return "/".join(d.strftime("%m.%d") for d in sorted_dates)
+
+
+def _trend_significant(trend: dict[str, Any], rel_threshold: float, abs_threshold: Optional[float]) -> bool:
+    if not trend.get("有数据"):
+        return False
+    means = trend.get("均值") or []
+    if len(means) < 2:
+        return False
+    mn = min(means)
+    mx = max(means)
+    amplitude = mx - mn
+    if abs_threshold is not None and amplitude >= abs_threshold:
+        return True
+    mean = sum(means) / len(means) if means else 0.0
+    if mean and amplitude / mean >= rel_threshold:
+        return True
+    return False
+
+
+def _fmt_trend_brief(trend: dict[str, Any], decimals: int, unit: str = "") -> str:
+    if not trend.get("有数据"):
+        return "无数据"
+    means = trend.get("均值") or []
+    if not means:
+        return "无数据"
+    fmt = lambda v: f"{v:.{decimals}f}"
+    mn = min(means)
+    mx = max(means)
+    direction = trend.get("方向", "—")
+    if direction == "↑":
+        word = "微升"
+    elif direction == "↓":
+        word = "微降"
+    else:
+        word = "稳定"
+    range_str = f"{fmt(mn)}~{fmt(mx)}"
+    if unit:
+        range_str = f"{range_str}{unit}"
+    dates = _fmt_trend_dates(trend)
+    suffix = f" [{dates}]" if dates else ""
+    return f"{word}（{range_str}）{suffix}"
+
+
+def _fmt_trend_layered(
+    trend: dict[str, Any], decimals: int, unit: str, rel_threshold: float, abs_threshold: Optional[float]
+) -> str:
+    if _trend_significant(trend, rel_threshold, abs_threshold):
+        return _fmt_trend(trend, decimals, unit)
+    return _fmt_trend_brief(trend, decimals, unit)
+
+
 def _fmt_trend(trend: dict[str, Any], decimals: int, unit: str = "") -> str:
     if not trend.get("有数据"):
         return "无数据"
@@ -619,6 +690,9 @@ def _fmt_trend(trend: dict[str, Any], decimals: int, unit: str = "") -> str:
     base = f"{seq} / {spark}（{trend.get('方向', '—')}）"
     if unit:
         base = f"{base}{unit}"
+    dates = _fmt_trend_dates(trend)
+    if dates:
+        base = f"{base} [{dates}]"
     anomalies = trend.get("异常") or []
     if not anomalies:
         return base
@@ -637,61 +711,65 @@ def build_wecom_text(report_date: dt.date, a: dict[str, Any], b: dict[str, Any])
 
     a_sinter_stat = a["制程"]["烧结压实"]
     b_sinter_stat = b["制程"]["烧结压实"]
-    a_sinter = _fmt_metric(a_sinter_stat, 3)
-    b_sinter = _fmt_metric(b_sinter_stat, 3)
+    a_sinter = _fmt_metric(a_sinter_stat, 3, force_status=True)
+    b_sinter = _fmt_metric(b_sinter_stat, 3, force_status=True)
     ab_sinter = _fmt_range(_merge_stats(a_sinter_stat, b_sinter_stat), 3)
 
     a_crush_stat = a["制程"]["粉碎压实"]
     b_crush_stat = b["制程"]["粉碎压实"]
-    a_crush = _fmt_metric(a_crush_stat, 3)
-    b_crush = _fmt_metric(b_crush_stat, 3)
+    a_crush = _fmt_metric(a_crush_stat, 3, force_status=True)
+    b_crush = _fmt_metric(b_crush_stat, 3, force_status=True)
     ab_crush = _fmt_range(_merge_stats(a_crush_stat, b_crush_stat), 3)
-    a_sinter_trend = _fmt_trend(a["制程"]["烧结压实趋势"], 3)
-    b_sinter_trend = _fmt_trend(b["制程"]["烧结压实趋势"], 3)
-    a_crush_trend = _fmt_trend(a["制程"]["粉碎压实趋势"], 3)
-    b_crush_trend = _fmt_trend(b["制程"]["粉碎压实趋势"], 3)
+    a_sinter_trend = _fmt_trend_layered(a["制程"]["烧结压实趋势"], 3, "", _TREND_SIGNIFICANT_REL, None)
+    b_sinter_trend = _fmt_trend_layered(b["制程"]["烧结压实趋势"], 3, "", _TREND_SIGNIFICANT_REL, None)
+    a_crush_trend = _fmt_trend_layered(a["制程"]["粉碎压实趋势"], 3, "", _TREND_SIGNIFICANT_REL, None)
+    b_crush_trend = _fmt_trend_layered(b["制程"]["粉碎压实趋势"], 3, "", _TREND_SIGNIFICANT_REL, None)
 
     a_prod_density_stat = a["成品"]["成品压实"]
     b_prod_density_stat = b["成品"]["成品压实"]
     ab_prod_density = _fmt_range(_merge_stats(a_prod_density_stat, b_prod_density_stat), 3)
 
-    a_charge = _fmt_metric(a["成品"]["0.1C充电"], 1)
-    a_discharge = _fmt_metric(a["成品"]["0.1C放电"], 1)
-    a_eff = _fmt_metric(a["成品"]["首效"], 2)
-    a_plat = _fmt_metric(a["成品"]["平台效率"], 1)
+    a_charge = _fmt_metric(a["成品"]["0.1C充电"], 1, force_status=True)
+    a_discharge = _fmt_metric(a["成品"]["0.1C放电"], 1, force_status=True)
+    a_eff = _fmt_metric(a["成品"]["首效"], 2, force_status=True)
+    a_plat = _fmt_metric(a["成品"]["平台效率"], 1, force_status=True)
 
-    b_charge = _fmt_metric(b["成品"]["0.1C充电"], 1)
-    b_discharge = _fmt_metric(b["成品"]["0.1C放电"], 1)
-    b_eff = _fmt_metric(b["成品"]["首效"], 2)
-    b_plat = _fmt_metric(b["成品"]["平台效率"], 1)
+    b_charge = _fmt_metric(b["成品"]["0.1C充电"], 1, force_status=True)
+    b_discharge = _fmt_metric(b["成品"]["0.1C放电"], 1, force_status=True)
+    b_eff = _fmt_metric(b["成品"]["首效"], 2, force_status=True)
+    b_plat = _fmt_metric(b["成品"]["平台效率"], 1, force_status=True)
 
     ab_alkali_stat = _merge_stats(a["成品"]["残碱(Li+)"], b["成品"]["残碱(Li+)"])
     ab_alkali = _fmt_range(ab_alkali_stat, 0)
     ab_alkali_status = _fmt_li_status(ab_alkali_stat)
-    a_carbon = _fmt_metric(a["成品"]["碳含量"], 2)
-    b_carbon = _fmt_metric(b["成品"]["碳含量"], 2)
-    a_powder_r = _fmt_metric(a["成品"]["粉阻(粉末电阻)"], 1)
-    b_powder_r = _fmt_metric(b["成品"]["粉阻(粉末电阻)"], 1)
-    a_bet = _fmt_metric(a["成品"]["比表(麦克比表)"], 1)
-    b_bet = _fmt_metric(b["成品"]["比表(麦克比表)"], 1)
-    a_prod_trend = _fmt_trend(a["成品"]["成品压实趋势"], 3)
-    b_prod_trend = _fmt_trend(b["成品"]["成品压实趋势"], 3)
-    a_charge_trend = _fmt_trend(a["成品"]["0.1C充电趋势"], 1)
-    b_charge_trend = _fmt_trend(b["成品"]["0.1C充电趋势"], 1)
-    a_discharge_trend = _fmt_trend(a["成品"]["0.1C放电趋势"], 1)
-    b_discharge_trend = _fmt_trend(b["成品"]["0.1C放电趋势"], 1)
-    a_eff_trend = _fmt_trend(a["成品"]["首效趋势"], 2)
-    b_eff_trend = _fmt_trend(b["成品"]["首效趋势"], 2)
-    a_plat_trend = _fmt_trend(a["成品"]["平台效率趋势"], 1)
-    b_plat_trend = _fmt_trend(b["成品"]["平台效率趋势"], 1)
-    a_li_trend = _fmt_trend(a["成品"]["残碱(Li+)趋势"], 0, unit="ppm")
-    b_li_trend = _fmt_trend(b["成品"]["残碱(Li+)趋势"], 0, unit="ppm")
-    a_carbon_trend = _fmt_trend(a["成品"]["碳含量趋势"], 2)
-    b_carbon_trend = _fmt_trend(b["成品"]["碳含量趋势"], 2)
-    a_powder_trend = _fmt_trend(a["成品"]["粉阻(粉末电阻)趋势"], 1)
-    b_powder_trend = _fmt_trend(b["成品"]["粉阻(粉末电阻)趋势"], 1)
-    a_bet_trend = _fmt_trend(a["成品"]["比表(麦克比表)趋势"], 1)
-    b_bet_trend = _fmt_trend(b["成品"]["比表(麦克比表)趋势"], 1)
+    a_carbon = _fmt_metric(a["成品"]["碳含量"], 2, force_status=True)
+    b_carbon = _fmt_metric(b["成品"]["碳含量"], 2, force_status=True)
+    a_powder_r = _fmt_metric(a["成品"]["粉阻(粉末电阻)"], 1, force_status=True)
+    b_powder_r = _fmt_metric(b["成品"]["粉阻(粉末电阻)"], 1, force_status=True)
+    a_bet = _fmt_metric(a["成品"]["比表(麦克比表)"], 1, force_status=True)
+    b_bet = _fmt_metric(b["成品"]["比表(麦克比表)"], 1, force_status=True)
+    a_prod_trend = _fmt_trend_layered(a["成品"]["成品压实趋势"], 3, "", _TREND_SIGNIFICANT_REL, None)
+    b_prod_trend = _fmt_trend_layered(b["成品"]["成品压实趋势"], 3, "", _TREND_SIGNIFICANT_REL, None)
+    a_charge_trend = _fmt_trend_layered(a["成品"]["0.1C充电趋势"], 1, "", _TREND_SIGNIFICANT_REL, None)
+    b_charge_trend = _fmt_trend_layered(b["成品"]["0.1C充电趋势"], 1, "", _TREND_SIGNIFICANT_REL, None)
+    a_discharge_trend = _fmt_trend_layered(a["成品"]["0.1C放电趋势"], 1, "", _TREND_SIGNIFICANT_REL, None)
+    b_discharge_trend = _fmt_trend_layered(b["成品"]["0.1C放电趋势"], 1, "", _TREND_SIGNIFICANT_REL, None)
+    a_eff_trend = _fmt_trend_layered(a["成品"]["首效趋势"], 2, "", _TREND_SIGNIFICANT_REL, None)
+    b_eff_trend = _fmt_trend_layered(b["成品"]["首效趋势"], 2, "", _TREND_SIGNIFICANT_REL, None)
+    a_plat_trend = _fmt_trend_layered(a["成品"]["平台效率趋势"], 1, "", _TREND_SIGNIFICANT_REL, None)
+    b_plat_trend = _fmt_trend_layered(b["成品"]["平台效率趋势"], 1, "", _TREND_SIGNIFICANT_REL, None)
+    a_li_trend = _fmt_trend_layered(
+        a["成品"]["残碱(Li+)趋势"], 0, "ppm", _TREND_SIGNIFICANT_REL_LI, _TREND_SIGNIFICANT_ABS_LI
+    )
+    b_li_trend = _fmt_trend_layered(
+        b["成品"]["残碱(Li+)趋势"], 0, "ppm", _TREND_SIGNIFICANT_REL_LI, _TREND_SIGNIFICANT_ABS_LI
+    )
+    a_carbon_trend = _fmt_trend_layered(a["成品"]["碳含量趋势"], 2, "", _TREND_SIGNIFICANT_REL, None)
+    b_carbon_trend = _fmt_trend_layered(b["成品"]["碳含量趋势"], 2, "", _TREND_SIGNIFICANT_REL, None)
+    a_powder_trend = _fmt_trend_layered(a["成品"]["粉阻(粉末电阻)趋势"], 1, "", _TREND_SIGNIFICANT_REL, None)
+    b_powder_trend = _fmt_trend_layered(b["成品"]["粉阻(粉末电阻)趋势"], 1, "", _TREND_SIGNIFICANT_REL, None)
+    a_bet_trend = _fmt_trend_layered(a["成品"]["比表(麦克比表)趋势"], 1, "", _TREND_SIGNIFICANT_REL, None)
+    b_bet_trend = _fmt_trend_layered(b["成品"]["比表(麦克比表)趋势"], 1, "", _TREND_SIGNIFICANT_REL, None)
 
     # 输出结构按你给的 1~6 段落口径；未提供的数据先保留占位，便于你后续把“第二张表”接进来。
     lines: list[str] = []
@@ -705,9 +783,9 @@ def build_wecom_text(report_date: dt.date, a: dict[str, Any], b: dict[str, Any])
     trend_points = max(a["制程"]["烧结压实趋势"].get("点数", 0), b["制程"]["烧结压实趋势"].get("点数", 0))
     trend_window = max(a["制程"]["烧结压实趋势"].get("窗口", 0), b["制程"]["烧结压实趋势"].get("窗口", 0))
     if trend_points:
-        label = f"近{trend_points}个有数日均值"
+        label = f"近{trend_points}日数据均值"
         if trend_window and trend_points < trend_window:
-            label = f"{label}（不足{trend_window}个有数日）"
+            label = f"{label}（不足{trend_window}日数据）"
         lines.append(f"  制程趋势（{label}）：")
         lines.append(f"    烧结压实 A线 {a_sinter_trend}；B线 {b_sinter_trend}。")
         lines.append(f"    粉碎压实 A线 {a_crush_trend}；B线 {b_crush_trend}。")
@@ -722,9 +800,9 @@ def build_wecom_text(report_date: dt.date, a: dict[str, Any], b: dict[str, Any])
     trend_points = max(a["成品"]["残碱(Li+)趋势"].get("点数", 0), b["成品"]["残碱(Li+)趋势"].get("点数", 0))
     trend_window = max(a["成品"]["残碱(Li+)趋势"].get("窗口", 0), b["成品"]["残碱(Li+)趋势"].get("窗口", 0))
     if trend_points:
-        label = f"近{trend_points}个有数日均值"
+        label = f"近{trend_points}日数据均值"
         if trend_window and trend_points < trend_window:
-            label = f"{label}（不足{trend_window}个有数日）"
+            label = f"{label}（不足{trend_window}日数据）"
         lines.append(f"  成品趋势（{label}）：")
         lines.append(f"    成品压实 A线 {a_prod_trend}；B线 {b_prod_trend}。")
         lines.append(f"    0.1C充电 A线 {a_charge_trend}；B线 {b_charge_trend}。")
