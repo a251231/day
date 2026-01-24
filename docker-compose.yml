@@ -1,4 +1,3 @@
-version: "3.9"
 services:
   wecom-report-ui:
     image: python:3.10-slim

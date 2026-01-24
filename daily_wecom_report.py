@@ -692,7 +692,7 @@ def _fmt_trend(trend: dict[str, Any], decimals: int, unit: str = "") -> str:
         base = f"{base}{unit}"
     dates = _fmt_trend_dates(trend)
     if dates:
-        base = f"{base} [{dates}]"
+        base = f"{base}（日期{dates}）"
     anomalies = trend.get("异常") or []
     if not anomalies:
         return base
