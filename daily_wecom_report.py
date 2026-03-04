@@ -323,10 +323,10 @@ def parse_spec_from_colname(col: str) -> Optional[Spec]:
     text = _sanitize_col(col).replace("～", "~").replace("—", "-").replace("−", "-")
     text = re.sub(r"(?<=\d),(?=\d)", ".", text)
 
-    m = re.search(rf"≥\s*({_NUM})", text)
+    m = re.search(rf"(?:≥|>=)\s*({_NUM})", text)
     if m:
         return Spec(lower=_to_float(m.group(1)), upper=None, text=f"≥{m.group(1)}")
-    m = re.search(rf"≤\s*({_NUM})", text)
+    m = re.search(rf"(?:≤|<=)\s*({_NUM})", text)
     if m:
         return Spec(lower=None, upper=_to_float(m.group(1)), text=f"≤{m.group(1)}")
     m = re.search(rf"({_NUM})\s*[~-]\s*({_NUM})", text)
@@ -573,6 +573,12 @@ def _batch_out_of_spec_summary(
         if spec is None:
             continue
         spec_cols += 1
+        if scale != 1.0:
+            spec = Spec(
+                lower=None if spec.lower is None else spec.lower * scale,
+                upper=None if spec.upper is None else spec.upper * scale,
+                text=spec.text,
+            )
 
         values = _to_num_series(day[c])
         if scale != 1.0:
@@ -1087,12 +1093,14 @@ def build_wecom_text(report_date: dt.date, a: dict[str, Any], b: dict[str, Any])
         lines.append(f"    粉碎压实 {LINE_A_LABEL} {a_crush_trend}；{LINE_B_LABEL} {b_crush_trend}。")
     lines.append("4、成品：")
     lines.append(f"  ①{LINE_A_LABEL}+{LINE_B_LABEL}成品压实：{ab_prod_density}。")
-    lines.append(f"  ②{LINE_A_LABEL}0.1C充电：{a_charge}；0.1C放电：{a_discharge}；首效：{a_eff}；平台效率：{a_plat}。")
-    lines.append(f"  ③{LINE_B_LABEL}0.1C充电：{b_charge}；0.1C放电：{b_discharge}；首效：{b_eff}；平台效率：{b_plat}。")
-    lines.append(f"  ④{LINE_A_LABEL}+{LINE_B_LABEL}残碱(Li+)：{_with_unit(ab_alkali, 'ppm')}{ab_alkali_status}。")
-    lines.append(f"  ⑤碳含量：{LINE_A_LABEL} {a_carbon}；{LINE_B_LABEL} {b_carbon}。")
-    lines.append(f"  ⑥粉阻(粉末电阻)：{LINE_A_LABEL} {a_powder_r}；{LINE_B_LABEL} {b_powder_r}。")
-    lines.append(f"  ⑦比表(麦克比表)：{LINE_A_LABEL} {a_bet}；{LINE_B_LABEL} {b_bet}。")
+    lines.append(f"  ②0.1C充电：{LINE_A_LABEL} {a_charge}；{LINE_B_LABEL} {b_charge}。")
+    lines.append(f"0.1C放电：{LINE_A_LABEL} {a_discharge}；{LINE_B_LABEL} {b_discharge}。")
+    lines.append(f"首效：{LINE_A_LABEL} {a_eff}；{LINE_B_LABEL} {b_eff}。")
+    lines.append(f"平台效率：{LINE_A_LABEL} {a_plat}；{LINE_B_LABEL} {b_plat}。")
+    lines.append(f"  ③残碱(Li+)：{LINE_A_LABEL}+{LINE_B_LABEL} {_with_unit(ab_alkali, 'ppm')}{ab_alkali_status}。")
+    lines.append(f"  ④碳含量：{LINE_A_LABEL} {a_carbon}；{LINE_B_LABEL} {b_carbon}。")
+    lines.append(f"  ⑤粉阻(粉末电阻)：{LINE_A_LABEL} {a_powder_r}；{LINE_B_LABEL} {b_powder_r}。")
+    lines.append(f"  ⑥比表(麦克比表)：{LINE_A_LABEL} {a_bet}；{LINE_B_LABEL} {b_bet}。")
     trend_points = max(a["成品"]["残碱(Li+)趋势"].get("点数", 0), b["成品"]["残碱(Li+)趋势"].get("点数", 0))
     trend_window = max(a["成品"]["残碱(Li+)趋势"].get("窗口", 0), b["成品"]["残碱(Li+)趋势"].get("窗口", 0))
     if trend_points:
@@ -1513,13 +1521,20 @@ def main() -> int:
     if args.sheet:
         if args.sheet not in all_sheets:
             raise ValueError(f"工作表不存在：{args.sheet}，可选：{', '.join(all_sheets)}")
+        if args.model:
+            sheet_model = detect_model_from_sheet(args.sheet)
+            if sheet_model != "UNKNOWN" and sheet_model != args.model:
+                raise ValueError(
+                    f"工作表 {args.sheet} 的型号为 {sheet_model}，与 --model {args.model} 不一致"
+                )
         target_sheet = args.sheet
     else:
         candidates = line_sheets
         if args.model:
-            by_model = [s for s in candidates if detect_model_from_sheet(s) == args.model]
-            if by_model:
-                candidates = by_model
+            candidates = [s for s in candidates if detect_model_from_sheet(s) == args.model]
+            if not candidates:
+                available = ", ".join([f"{s}({detect_model_from_sheet(s)})" for s in line_sheets])
+                raise ValueError(f"未找到型号为 {args.model} 的候选线别；现有：{available}")
         for s in candidates:
             try:
                 _ = load_sheet_table(path, s)
@@ -1536,7 +1551,7 @@ def main() -> int:
 
     trend_days = 0 if args.disable_trend else max(0, int(args.trend_days))
     detected_model = detect_model_from_sheet(target_sheet)
-    model = args.model or detected_model
+    model = detected_model if detected_model != "UNKNOWN" else (args.model or detected_model)
     profile = PRODUCT_SPEC_PROFILES.get(model, get_profile_for_sheet(target_sheet))
 
     report_date = pick_date_from_dfs([df], args.date)
