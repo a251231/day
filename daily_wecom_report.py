@@ -1477,10 +1477,6 @@ def _fmt_status(stat: dict[str, Any], force: bool = False) -> str:
             elif abnormal is False:
                 parts.append("正常")
 
-    if state == STAT_STALE:
-        lag_days = int(stat.get("lag_days", 0))
-        parts.append(f"滞后{lag_days}天")
-
     if not parts:
         return ""
     return f"（{'；'.join([p for p in parts if p])}）"
@@ -1493,12 +1489,10 @@ def _fmt_source_date(stat: dict[str, Any]) -> str:
     if not isinstance(d, dt.date):
         return ""
     date_str = d.strftime("%Y.%m.%d")
-    lag_days = int(stat.get("lag_days", 0))
-    lag_text = "当日" if lag_days <= 0 else f"滞后{lag_days}天"
     batch_summary = stat.get("来源批次摘要")
     if isinstance(batch_summary, str) and batch_summary:
-        return f"（来源{date_str}，{lag_text}，投料批次{batch_summary}）"
-    return f"（来源{date_str}，{lag_text}，投料批次未知）"
+        return f"（投料时间{date_str}，投料批次{batch_summary}）"
+    return f"（投料时间{date_str}，投料批次未知）"
 
 
 def _with_unit(value: str, unit: str) -> str:
