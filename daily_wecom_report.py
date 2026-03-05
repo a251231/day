@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import glob
+import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -19,11 +21,34 @@ LINE_B_SHEET = "S006-B线"
 LINE_A_LABEL = "S18-A线"
 LINE_B_LABEL = "S006-B线"
 
+STAT_HAS_DATA = "有数据"
+STAT_NO_DATA = "无数据"
+STAT_UNCONFIGURED = "未配置"
+STAT_STALE = "滞后"
+STAT_UNCONFIGURED_TEXT = "本线未配置指标"
+
+DEFAULT_SPEC_REGISTRY_PATH = os.path.join("config", "spec_registry.yaml")
+
 
 @dataclass(frozen=True)
 class ProductSpecProfile:
     model: str
     enable_spec: bool
+
+
+@dataclass(frozen=True)
+class StaleThresholdConfig:
+    process_days: int = 2
+    product_days: int = 3
+    electrochem_days: int = 5
+
+
+@dataclass(frozen=True)
+class SpecHealthConfig:
+    enabled: bool = True
+    window_days: int = 14
+    abnormal_ratio_threshold: float = 0.4
+    min_consecutive_days: int = 5
 
 
 PRODUCT_SPEC_PROFILES: dict[str, ProductSpecProfile] = {
@@ -53,13 +78,29 @@ def _norm_cell(value: Any) -> str:
     return text
 
 
-def _ffill_right(values: Iterable[Any]) -> list[str]:
+def _is_spec_token(text: str) -> bool:
+    s = _sanitize_col(text)
+    if not s:
+        return False
+    if any(mark in s for mark in ("≤", "≥", "<=", ">=", "~", "±", "%", "ppm", "PPM")):
+        return True
+    if re.search(r"\d+(?:\.\d+)?\s*[-~]\s*\d+(?:\.\d+)?", s):
+        return True
+    return False
+
+
+def _ffill_right(values: Iterable[Any], block_spec_token: bool = False) -> list[str]:
     out: list[str] = []
     last = ""
     for v in values:
         s = _norm_cell(v)
         if s:
             last = s
+            out.append(last)
+            continue
+        if block_spec_token and _is_spec_token(last):
+            out.append("")
+            continue
         out.append(last)
     return out
 
@@ -110,13 +151,43 @@ def list_workbook_sheets(path: str) -> list[str]:
         return [str(n).strip() for n in book.sheet_names if str(n).strip()]
 
 
-def list_line_sheets(path: str) -> list[str]:
+def _has_effective_data_body(df: pd.DataFrame) -> bool:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return False
+    body = df.drop(columns=["投料日期", "批次", "是否为验证批次"], errors="ignore")
+    if body.empty:
+        return False
+    normalized = body.apply(lambda col: col.map(_norm_cell))
+    normalized = normalized.apply(lambda col: col.where(col.str.strip().ne(""), np.nan))
+    normalized = normalized.apply(lambda col: col.where(col.str.lower().ne("nan"), np.nan))
+    return not normalized.dropna(how="all").empty
+
+
+def list_line_sheets_with_skipped(path: str) -> tuple[list[str], dict[str, str]]:
     sheets = list_workbook_sheets(path)
     line_like = [s for s in sheets if "线" in s]
-    if not line_like:
-        return sheets
-    preferred = [s for s in line_like if detect_model_from_sheet(s) != "UNKNOWN"]
-    return preferred if preferred else line_like
+    candidates = line_like if line_like else sheets
+    preferred = [s for s in candidates if detect_model_from_sheet(s) != "UNKNOWN"]
+    candidates = preferred if preferred else candidates
+
+    usable: list[str] = []
+    skipped: dict[str, str] = {}
+    for sheet_name in candidates:
+        try:
+            df = load_sheet_table(path, sheet_name)
+        except Exception as e:
+            skipped[sheet_name] = f"无法解析：{e}"
+            continue
+        if not _has_effective_data_body(df):
+            skipped[sheet_name] = "无数据体"
+            continue
+        usable.append(sheet_name)
+    return usable, skipped
+
+
+def list_line_sheets(path: str) -> list[str]:
+    usable, _ = list_line_sheets_with_skipped(path)
+    return usable
 
 
 _BATCH_RE = re.compile(r"^(?:D?[AB]\d{4}-\d{3}|[A-Za-z]+\d{3,8}-\d{2,4})$")
@@ -135,7 +206,7 @@ def _col_contains(col: str, token: str) -> bool:
 def _find_row_contains(df: pd.DataFrame, keyword: str, max_rows: int = 80) -> Optional[int]:
     for i in range(min(len(df), max_rows)):
         row = df.iloc[i].astype(str)
-        if row.str.contains(keyword, na=False).any():
+        if row.str.contains(keyword, na=False, regex=False).any():
             return i
     return None
 
@@ -192,7 +263,16 @@ def _find_data_start(df: pd.DataFrame, header_start: int = 0, max_rows: int = 24
 
 
 def _make_columns_from_multirow_header(header_df: pd.DataFrame) -> list[str]:
-    filled_rows = [_ffill_right(header_df.iloc[i].tolist()) for i in range(len(header_df))]
+    row_count = len(header_df)
+    filled_rows: list[list[str]] = []
+    for i in range(row_count):
+        row_values = header_df.iloc[i].tolist()
+        # 前两行可右向填充；最后一行保留原位，避免规格口径串列到右侧指标
+        if i < max(0, row_count - 1):
+            filled_rows.append(_ffill_right(row_values, block_spec_token=True))
+        else:
+            filled_rows.append([_norm_cell(v) for v in row_values])
+
     cols: list[str] = []
     for j in range(header_df.shape[1]):
         parts: list[str] = []
@@ -310,6 +390,14 @@ class Spec:
     text: str
 
 
+@dataclass(frozen=True)
+class SpecRule:
+    metric: str
+    spec: Spec
+    model: Optional[str] = None
+    line: Optional[str] = None
+
+
 _NUM = r"[-+]?\d+(?:[.,]\d+)?"
 
 
@@ -340,6 +428,296 @@ def parse_spec_from_colname(col: str) -> Optional[Spec]:
         x = _to_float(m.group(1))
         y = _to_float(m.group(2))
         return Spec(lower=x - y, upper=x + y, text=f"{x}±{y}")
+    return None
+
+
+def _normalize_match_key(text: str) -> str:
+    normalized = _sanitize_col(text).lower()
+    return re.sub(r"[\s_\-\(\)\[\]\{\}]+", "", normalized)
+
+
+def _parse_spec_literal(spec_text: str) -> Optional[Spec]:
+    text = _sanitize_col(spec_text)
+    if not text:
+        return None
+    return parse_spec_from_colname(f"口径_{text}")
+
+
+def load_spec_registry(path: Optional[str]) -> list[SpecRule]:
+    if not path:
+        return []
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+    except Exception:
+        return []
+    if not raw:
+        return []
+
+    data: Any = None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        try:
+            import yaml  # type: ignore
+
+            data = yaml.safe_load(raw)
+        except Exception:
+            data = None
+
+    if data is None:
+        return []
+    rules_data = data.get("rules") if isinstance(data, dict) else data
+    if not isinstance(rules_data, list):
+        return []
+
+    out: list[SpecRule] = []
+    for item in rules_data:
+        if not isinstance(item, dict):
+            continue
+        metric = _norm_cell(item.get("metric"))
+        if not metric:
+            continue
+        spec_obj: Optional[Spec] = None
+        raw_spec = item.get("spec")
+        if isinstance(raw_spec, dict):
+            lower = _parse_num(raw_spec.get("lower"))
+            upper = _parse_num(raw_spec.get("upper"))
+            if lower is None and upper is None:
+                continue
+            text = _norm_cell(raw_spec.get("text")) or (
+                f"{lower}-{upper}"
+                if lower is not None and upper is not None
+                else (f"≥{lower}" if lower is not None else f"≤{upper}")
+            )
+            spec_obj = Spec(lower=lower, upper=upper, text=text)
+        else:
+            spec_obj = _parse_spec_literal(_norm_cell(raw_spec))
+        if spec_obj is None:
+            continue
+        model = _norm_cell(item.get("model")).upper() or None
+        line = _norm_cell(item.get("line")) or None
+        out.append(SpecRule(metric=metric, spec=spec_obj, model=model, line=line))
+    return out
+
+
+def _resolve_spec_from_registry(
+    rules: list[SpecRule], line_label: str, model: str, metric_key: str, cols: list[str]
+) -> Optional[Spec]:
+    if not rules:
+        return None
+    line_norm = _normalize_match_key(line_label)
+    model_norm = _normalize_match_key(model.upper())
+    metric_norm = _normalize_match_key(metric_key)
+    col_norms = [_normalize_match_key(c) for c in cols]
+
+    def _metric_match(rule_metric: str) -> tuple[bool, int]:
+        rule_norm = _normalize_match_key(rule_metric)
+        if not rule_norm:
+            return False, 0
+        if metric_norm and rule_norm == metric_norm:
+            return True, 20
+        if metric_norm and (rule_norm in metric_norm or metric_norm in rule_norm):
+            return True, 15
+        if any(rule_norm in c or c in rule_norm for c in col_norms if c):
+            return True, 10
+        return False, 0
+
+    best: Optional[tuple[int, Spec]] = None
+    for rule in rules:
+        matched, metric_score = _metric_match(rule.metric)
+        if not matched:
+            continue
+
+        score = metric_score
+        if rule.line:
+            if _normalize_match_key(rule.line) != line_norm:
+                continue
+            score += 100
+        if rule.model:
+            if _normalize_match_key(rule.model) != model_norm:
+                continue
+            score += 30
+
+        if best is None or score > best[0]:
+            best = (score, rule.spec)
+    return best[1] if best is not None else None
+
+
+def _spec_is_reasonable_for_metric(col: str, spec: Spec) -> bool:
+    # 0.1C 相关指标常见量纲为百量级，若口径上限仍小于10通常是误拼接（例如继承了 Li+ ≤0.055）
+    if any(_col_contains(col, k) for k in ("0.1C充", "0.1C放", "0.1C首效")):
+        bounds = [x for x in (spec.lower, spec.upper) if x is not None]
+        if not bounds:
+            return False
+        if max(abs(x) for x in bounds) < 10:
+            return False
+    return True
+
+
+def _normalized_spec_for_metric(col: str, scale: float = 1.0) -> Optional[Spec]:
+    spec = parse_spec_from_colname(col)
+    if spec is None:
+        return None
+    if not _spec_is_reasonable_for_metric(col, spec):
+        return None
+    scale_value = float(scale if scale is not None else 1.0)
+    if scale_value != 1.0:
+        spec = Spec(
+            lower=None if spec.lower is None else spec.lower * scale_value,
+            upper=None if spec.upper is None else spec.upper * scale_value,
+            text=spec.text,
+        )
+    return spec
+
+
+def _scale_spec(spec: Optional[Spec], scale: float = 1.0) -> Optional[Spec]:
+    if spec is None:
+        return None
+    scale_value = float(scale if scale is not None else 1.0)
+    if scale_value == 1.0:
+        return spec
+    return Spec(
+        lower=None if spec.lower is None else spec.lower * scale_value,
+        upper=None if spec.upper is None else spec.upper * scale_value,
+        text=spec.text,
+    )
+
+
+def _state_has_data(state: str) -> bool:
+    return state in (STAT_HAS_DATA, STAT_STALE)
+
+
+def _spec_health_is_suspect(stat: dict[str, Any]) -> bool:
+    info = stat.get("spec_health")
+    return isinstance(info, dict) and bool(info.get("suspected"))
+
+
+def _spec_health_text(stat: dict[str, Any]) -> str:
+    info = stat.get("spec_health")
+    if not isinstance(info, dict) or not info.get("suspected"):
+        return ""
+    abnormal_days = int(info.get("abnormal_days", 0))
+    total_days = int(info.get("total_days", 0))
+    longest = int(info.get("longest_consecutive_abnormal", 0))
+    if total_days <= 0:
+        return "治理关注：口径疑似不匹配"
+    return f"治理关注：口径疑似不匹配（{abnormal_days}/{total_days}天异常，最长连续{longest}天）"
+
+
+def _metric_group_for_stale(section: str, metric_key: str) -> str:
+    if section == "制程":
+        return "process"
+    if metric_key in ("0.1C充电", "0.1C放电", "首效", "平台效率"):
+        return "electrochem"
+    return "product"
+
+
+def _stale_threshold_for_metric(section: str, metric_key: str, cfg: StaleThresholdConfig) -> int:
+    group = _metric_group_for_stale(section, metric_key)
+    if group == "process":
+        return int(cfg.process_days)
+    if group == "electrochem":
+        return int(cfg.electrochem_days)
+    return int(cfg.product_days)
+
+
+def _compute_spec_health_for_metric(
+    df: pd.DataFrame,
+    cols: list[str],
+    report_date: dt.date,
+    scale: float,
+    enable_spec: bool,
+    spec: Optional[Spec],
+    window_days: int,
+    abnormal_ratio_threshold: float,
+    min_consecutive_days: int,
+) -> Optional[dict[str, Any]]:
+    if not enable_spec or spec is None or not cols or "投料日期" not in df.columns:
+        return None
+    if window_days <= 0:
+        return None
+
+    points: list[tuple[dt.date, bool]] = []
+    scan_limit = max(60, window_days * 8)
+    for delta in range(0, scan_limit + 1):
+        d = report_date - dt.timedelta(days=delta)
+        day = df[df["投料日期"] == d]
+        st = _stat_for_cols(day, cols, scale=scale, enable_spec=enable_spec, explicit_spec=spec)
+        if not st.get("有数据"):
+            continue
+        judge = st.get("判异")
+        abnormal = bool(isinstance(judge, dict) and judge.get("异常"))
+        points.append((d, abnormal))
+        if len(points) >= window_days:
+            break
+
+    if not points:
+        return None
+
+    points = list(reversed(points))
+    total_days = len(points)
+    abnormal_days = sum(1 for _, abnormal in points if abnormal)
+    ratio = abnormal_days / total_days if total_days else 0.0
+    longest = 0
+    current = 0
+    for _, abnormal in points:
+        if abnormal:
+            current += 1
+            if current > longest:
+                longest = current
+        else:
+            current = 0
+
+    suspected = ratio >= float(abnormal_ratio_threshold) and longest >= int(min_consecutive_days)
+    return {
+        "total_days": int(total_days),
+        "abnormal_days": int(abnormal_days),
+        "abnormal_ratio": float(ratio),
+        "longest_consecutive_abnormal": int(longest),
+        "suspected": bool(suspected),
+        "window_days": int(window_days),
+    }
+
+
+def _stat_state(stat: dict[str, Any]) -> str:
+    if not isinstance(stat, dict):
+        return STAT_NO_DATA
+    state = stat.get("状态")
+    if state in (STAT_HAS_DATA, STAT_STALE, STAT_NO_DATA, STAT_UNCONFIGURED):
+        return str(state)
+    if stat.get("有数据"):
+        return STAT_HAS_DATA
+    return STAT_NO_DATA
+
+
+def _resolve_metric_spec(
+    *,
+    cols: list[str],
+    scale: float,
+    enable_spec: bool,
+    metric_key: str,
+    line_label: str,
+    model: str,
+    spec_registry: Optional[list[SpecRule]],
+) -> Optional[Spec]:
+    if not enable_spec:
+        return None
+    registry_spec = _resolve_spec_from_registry(
+        rules=spec_registry or [],
+        line_label=line_label,
+        model=model,
+        metric_key=metric_key,
+        cols=cols,
+    )
+    if registry_spec is not None:
+        return _scale_spec(registry_spec, scale=scale)
+    for c in cols:
+        spec = _normalized_spec_for_metric(c, scale=scale)
+        if spec is not None:
+            return spec
     return None
 
 
@@ -414,33 +792,47 @@ def pick_date(df_a: pd.DataFrame, df_b: pd.DataFrame, date_arg: Optional[str]) -
     return pick_date_from_dfs([df_a, df_b], date_arg)
 
 
-def _stat_for_cols(day: pd.DataFrame, cols: list[str], scale: float = 1.0, enable_spec: bool = True) -> dict[str, Any]:
+def _stat_for_cols(
+    day: pd.DataFrame,
+    cols: list[str],
+    scale: float = 1.0,
+    enable_spec: bool = True,
+    metric_key: str = "",
+    line_label: str = "",
+    model: str = "UNKNOWN",
+    spec_registry: Optional[list[SpecRule]] = None,
+    explicit_spec: Optional[Spec] = None,
+) -> dict[str, Any]:
     values = _flatten_numeric_values(day, cols)
     if scale != 1.0:
         values = values * scale
     st = _range_stat(values)
     if st is None:
-        return {"有数据": False}
-    batch_judge = _batch_out_of_spec_summary(day, cols, scale=scale, enable_spec=enable_spec)
-    spec = parse_spec_from_colname(cols[0]) if (cols and enable_spec) else None
-    if spec is not None and scale != 1.0:
-        spec = Spec(
-            lower=None if spec.lower is None else spec.lower * scale,
-            upper=None if spec.upper is None else spec.upper * scale,
-            text=spec.text,
-        )
+        return {"有数据": False, "状态": STAT_NO_DATA, "quality_flags": []}
+    spec = explicit_spec or _resolve_metric_spec(
+        cols=cols,
+        scale=scale,
+        enable_spec=enable_spec,
+        metric_key=metric_key,
+        line_label=line_label,
+        model=model,
+        spec_registry=spec_registry,
+    )
+    batch_judge = _batch_out_of_spec_summary(day, cols, scale=scale, enable_spec=enable_spec, explicit_spec=spec)
     judge = judge_out_of_spec(values, spec)
     if isinstance(batch_judge, dict):
         abnormal_batches = int(batch_judge.get("异常批次", 0))
         judge = {"异常": abnormal_batches > 0, "口径": "按列规格(按批次汇总)"}
     return {
         "有数据": True,
+        "状态": STAT_HAS_DATA,
         "min": st.min,
         "max": st.max,
         "mean": st.mean,
         "n": st.n,
         "判异": judge,
         "批次判异": batch_judge,
+        "quality_flags": [],
     }
 
 
@@ -547,7 +939,11 @@ def _batch_summary_for_day(day: pd.DataFrame, cols: list[str]) -> str:
 
 
 def _batch_out_of_spec_summary(
-    day: pd.DataFrame, cols: list[str], scale: float = 1.0, enable_spec: bool = True
+    day: pd.DataFrame,
+    cols: list[str],
+    scale: float = 1.0,
+    enable_spec: bool = True,
+    explicit_spec: Optional[Spec] = None,
 ) -> Optional[dict[str, int]]:
     if day.empty or "批次" not in day.columns or not enable_spec:
         return None
@@ -566,19 +962,14 @@ def _batch_out_of_spec_summary(
     abnormal_batches: set[str] = set()
     low_batches: set[str] = set()
     high_batches: set[str] = set()
-    spec_cols = 0
+    spec_cols = 0 if explicit_spec is None else 1
 
     for c in metric_cols:
-        spec = parse_spec_from_colname(c)
+        spec = explicit_spec if explicit_spec is not None else _normalized_spec_for_metric(c, scale=scale)
         if spec is None:
             continue
-        spec_cols += 1
-        if scale != 1.0:
-            spec = Spec(
-                lower=None if spec.lower is None else spec.lower * scale,
-                upper=None if spec.upper is None else spec.upper * scale,
-                text=spec.text,
-            )
+        if explicit_spec is None:
+            spec_cols += 1
 
         values = _to_num_series(day[c])
         if scale != 1.0:
@@ -622,20 +1013,73 @@ def _latest_stat_within_days(
     lookback_days: int,
     scale: float = 1.0,
     enable_spec: bool = True,
+    configured: bool = True,
+    metric_key: str = "",
+    section: str = "",
+    line_label: str = "",
+    model: str = "UNKNOWN",
+    line_max_date: Optional[dt.date] = None,
+    stale_threshold_days: int = 0,
+    spec_registry: Optional[list[SpecRule]] = None,
+    spec_health: Optional[SpecHealthConfig] = None,
 ) -> dict[str, Any]:
+    if not configured:
+        return {"有数据": False, "状态": STAT_UNCONFIGURED, "quality_flags": []}
     if "投料日期" not in df.columns:
-        return {"有数据": False}
+        return {"有数据": False, "状态": STAT_NO_DATA, "quality_flags": []}
+
+    metric_spec = _resolve_metric_spec(
+        cols=cols,
+        scale=scale,
+        enable_spec=enable_spec,
+        metric_key=metric_key,
+        line_label=line_label,
+        model=model,
+        spec_registry=spec_registry,
+    )
+    spec_health_info = None
+    if spec_health and spec_health.enabled:
+        spec_health_info = _compute_spec_health_for_metric(
+            df=df,
+            cols=cols,
+            report_date=report_date,
+            scale=scale,
+            enable_spec=enable_spec,
+            spec=metric_spec,
+            window_days=max(1, int(spec_health.window_days)),
+            abnormal_ratio_threshold=float(spec_health.abnormal_ratio_threshold),
+            min_consecutive_days=max(1, int(spec_health.min_consecutive_days)),
+        )
 
     for delta in range(0, max(0, lookback_days) + 1):
         d = report_date - dt.timedelta(days=delta)
         day = df[df["投料日期"] == d]
-        st = _stat_for_cols(day, cols, scale=scale, enable_spec=enable_spec)
+        st = _stat_for_cols(
+            day,
+            cols,
+            scale=scale,
+            enable_spec=enable_spec,
+            metric_key=metric_key,
+            line_label=line_label,
+            model=model,
+            spec_registry=spec_registry,
+            explicit_spec=metric_spec,
+        )
         if st.get("有数据"):
+            lag_base = line_max_date if isinstance(line_max_date, dt.date) else report_date
+            lag_days = max(0, (lag_base - d).days)
+            st["状态"] = STAT_STALE if lag_days > max(0, int(stale_threshold_days)) else STAT_HAS_DATA
             st["来源日期"] = d
             st["是否当日"] = (delta == 0)
             st["来源批次摘要"] = _batch_summary_for_day(day, cols)
+            st["lag_days"] = int(lag_days)
+            st["quality_flags"] = list(st.get("quality_flags", []))
+            if isinstance(spec_health_info, dict):
+                st["spec_health"] = spec_health_info
+                if bool(spec_health_info.get("suspected")):
+                    st["quality_flags"].append("口径疑似不匹配")
             return st
-    return {"有数据": False}
+    return {"有数据": False, "状态": STAT_NO_DATA, "quality_flags": []}
 
 
 _LI_PASS_MAX = 500
@@ -657,22 +1101,38 @@ def _trend_for_cols(
     anomaly_ratio: float = _TREND_ANOMALY_RATIO,
     anomaly_abs: Optional[float] = None,
     enable_spec: bool = True,
+    configured: bool = True,
+    metric_key: str = "",
+    line_label: str = "",
+    model: str = "UNKNOWN",
+    spec_registry: Optional[list[SpecRule]] = None,
 ) -> dict[str, Any]:
+    if not configured:
+        return {"有数据": False, "状态": STAT_UNCONFIGURED, "窗口": trend_points, "点数": 0}
     if "投料日期" not in df.columns or not cols or trend_points <= 0:
-        return {"有数据": False, "窗口": trend_points, "点数": 0}
+        return {"有数据": False, "状态": STAT_NO_DATA, "窗口": trend_points, "点数": 0}
 
     points: list[tuple[dt.date, dict[str, Any]]] = []
     for delta in range(0, max_lookback_days + 1):
         d = report_date - dt.timedelta(days=delta)
         day = df[df["投料日期"] == d]
-        st = _stat_for_cols(day, cols, scale=scale, enable_spec=enable_spec)
+        st = _stat_for_cols(
+            day,
+            cols,
+            scale=scale,
+            enable_spec=enable_spec,
+            metric_key=metric_key,
+            line_label=line_label,
+            model=model,
+            spec_registry=spec_registry,
+        )
         if st.get("有数据"):
             points.append((d, st))
             if len(points) >= trend_points:
                 break
 
     if not points:
-        return {"有数据": False, "窗口": trend_points, "点数": 0}
+        return {"有数据": False, "状态": STAT_NO_DATA, "窗口": trend_points, "点数": 0}
 
     points = list(reversed(points))
     means = [p[1]["mean"] for p in points]
@@ -694,6 +1154,7 @@ def _trend_for_cols(
 
     return {
         "有数据": True,
+        "状态": STAT_HAS_DATA,
         "窗口": trend_points,
         "点数": len(points),
         "日期": [p[0] for p in points],
@@ -709,11 +1170,23 @@ def extract_metrics(
     lookback_days: int,
     trend_days: int = 7,
     enable_spec: bool = True,
+    line_label: str = "",
+    model: str = "UNKNOWN",
+    stale_thresholds: Optional[StaleThresholdConfig] = None,
+    spec_registry: Optional[list[SpecRule]] = None,
+    spec_health: Optional[SpecHealthConfig] = None,
 ) -> dict[str, Any]:
     if "投料日期" in df.columns:
         day = df[df["投料日期"] == report_date].copy()
+        line_dates = [d for d in df["投料日期"].dropna().tolist() if isinstance(d, dt.date)]
+        line_max_date = max(line_dates) if line_dates else report_date
     else:
         day = df.head(0).copy()
+        line_max_date = report_date
+
+    stale_cfg = stale_thresholds or StaleThresholdConfig()
+    health_cfg = spec_health or SpecHealthConfig()
+    registry_rules = spec_registry or []
 
     # 注意：很多表会出现“均值未填，但B1-1/B1-2/B1-3已填”的情况，因此这里不只取“均值”
     sinter_cols = [c for c in df.columns if "烧结压实" in c]
@@ -740,7 +1213,33 @@ def extract_metrics(
     trend_lookback_days = max(lookback_days, trend_days * 5, 30)
     trend_lookback_days = min(trend_lookback_days, _TREND_MAX_LOOKBACK_DAYS)
 
-    def _trend(cols: list[str], scale: float = 1.0, anomaly_abs: Optional[float] = None) -> dict[str, Any]:
+    def _latest(section: str, metric_key: str, cols: list[str], scale: float = 1.0, configured: bool = True) -> dict[str, Any]:
+        return _latest_stat_within_days(
+            df=df,
+            cols=cols,
+            report_date=report_date,
+            lookback_days=lookback_days,
+            scale=scale,
+            enable_spec=enable_spec,
+            configured=configured,
+            metric_key=metric_key,
+            section=section,
+            line_label=line_label,
+            model=model,
+            line_max_date=line_max_date,
+            stale_threshold_days=_stale_threshold_for_metric(section, metric_key, stale_cfg),
+            spec_registry=registry_rules,
+            spec_health=health_cfg,
+        )
+
+    def _trend(
+        section: str,
+        metric_key: str,
+        cols: list[str],
+        scale: float = 1.0,
+        anomaly_abs: Optional[float] = None,
+        configured: bool = True,
+    ) -> dict[str, Any]:
         return _trend_for_cols(
             df,
             cols,
@@ -750,45 +1249,54 @@ def extract_metrics(
             scale=scale,
             anomaly_abs=anomaly_abs,
             enable_spec=enable_spec,
+            configured=configured,
+            metric_key=metric_key,
+            line_label=line_label,
+            model=model,
+            spec_registry=registry_rules,
         )
 
-    li_trend = _trend(li_cols, scale=10000, anomaly_abs=_LI_TREND_ANOMALY_ABS)
-    sinter_trend = _trend(sinter_cols)
-    crush_trend = _trend(crush_cols)
-    prod_density_trend = _trend(prod_density_cols)
-    powder_res_trend = _trend(powder_res_cols)
-    carbon_trend = _trend(carbon_cols)
-    bet_trend = _trend(bet_cols)
-    charge_trend = _trend(charge_cols)
-    discharge_trend = _trend(discharge_cols)
-    eff_trend = _trend(eff_cols)
-    plat_trend = _trend(plat_cols)
+    li_configured = bool(li_cols)
+    sinter_configured = bool(sinter_cols)
+    crush_configured = bool(crush_cols)
+    prod_density_configured = bool(prod_density_cols)
+    powder_res_configured = bool(powder_res_cols)
+    carbon_configured = bool(carbon_cols)
+    bet_configured = bool(bet_cols)
+    charge_configured = bool(charge_cols)
+    discharge_configured = bool(discharge_cols)
+    eff_configured = bool(eff_cols)
+    plat_configured = bool(plat_cols)
+
+    li_trend = _trend("成品", "残碱(Li+)", li_cols, scale=10000, anomaly_abs=_LI_TREND_ANOMALY_ABS, configured=li_configured)
+    sinter_trend = _trend("制程", "烧结压实", sinter_cols, configured=sinter_configured)
+    crush_trend = _trend("制程", "粉碎压实", crush_cols, configured=crush_configured)
+    prod_density_trend = _trend("成品", "成品压实", prod_density_cols, configured=prod_density_configured)
+    powder_res_trend = _trend("成品", "粉阻(粉末电阻)", powder_res_cols, configured=powder_res_configured)
+    carbon_trend = _trend("成品", "碳含量", carbon_cols, configured=carbon_configured)
+    bet_trend = _trend("成品", "比表(麦克比表)", bet_cols, configured=bet_configured)
+    charge_trend = _trend("成品", "0.1C充电", charge_cols, configured=charge_configured)
+    discharge_trend = _trend("成品", "0.1C放电", discharge_cols, configured=discharge_configured)
+    eff_trend = _trend("成品", "首效", eff_cols, configured=eff_configured)
+    plat_trend = _trend("成品", "平台效率", plat_cols, configured=plat_configured)
 
     return {
         "制程": {
-            "烧结压实": _latest_stat_within_days(df, sinter_cols, report_date, lookback_days, enable_spec=enable_spec),
-            "粉碎压实": _latest_stat_within_days(df, crush_cols, report_date, lookback_days, enable_spec=enable_spec),
+            "烧结压实": _latest("制程", "烧结压实", sinter_cols, configured=sinter_configured),
+            "粉碎压实": _latest("制程", "粉碎压实", crush_cols, configured=crush_configured),
             "烧结压实趋势": sinter_trend,
             "粉碎压实趋势": crush_trend,
         },
         "成品": {
-            "成品压实": _latest_stat_within_days(
-                df, prod_density_cols, report_date, lookback_days, enable_spec=enable_spec
-            ),
-            "0.1C充电": _latest_stat_within_days(df, charge_cols, report_date, lookback_days, enable_spec=enable_spec),
-            "0.1C放电": _latest_stat_within_days(
-                df, discharge_cols, report_date, lookback_days, enable_spec=enable_spec
-            ),
-            "首效": _latest_stat_within_days(df, eff_cols, report_date, lookback_days, enable_spec=enable_spec),
-            "平台效率": _latest_stat_within_days(df, plat_cols, report_date, lookback_days, enable_spec=enable_spec),
-            "残碱(Li+)": _latest_stat_within_days(
-                df, li_cols, report_date, lookback_days, scale=10000, enable_spec=enable_spec
-            ),
-            "碳含量": _latest_stat_within_days(df, carbon_cols, report_date, lookback_days, enable_spec=enable_spec),
-            "粉阻(粉末电阻)": _latest_stat_within_days(
-                df, powder_res_cols, report_date, lookback_days, enable_spec=enable_spec
-            ),
-            "比表(麦克比表)": _latest_stat_within_days(df, bet_cols, report_date, lookback_days, enable_spec=enable_spec),
+            "成品压实": _latest("成品", "成品压实", prod_density_cols, configured=prod_density_configured),
+            "0.1C充电": _latest("成品", "0.1C充电", charge_cols, configured=charge_configured),
+            "0.1C放电": _latest("成品", "0.1C放电", discharge_cols, configured=discharge_configured),
+            "首效": _latest("成品", "首效", eff_cols, configured=eff_configured),
+            "平台效率": _latest("成品", "平台效率", plat_cols, configured=plat_configured),
+            "残碱(Li+)": _latest("成品", "残碱(Li+)", li_cols, scale=10000, configured=li_configured),
+            "碳含量": _latest("成品", "碳含量", carbon_cols, configured=carbon_configured),
+            "粉阻(粉末电阻)": _latest("成品", "粉阻(粉末电阻)", powder_res_cols, configured=powder_res_configured),
+            "比表(麦克比表)": _latest("成品", "比表(麦克比表)", bet_cols, configured=bet_configured),
             "残碱(Li+)趋势": li_trend,
             "成品压实趋势": prod_density_trend,
             "0.1C充电趋势": charge_trend,
@@ -803,9 +1311,99 @@ def extract_metrics(
     }
 
 
+def resolve_report_dates(
+    line_dfs: dict[str, pd.DataFrame], date_arg: Optional[str], date_mode: str = "per-line"
+) -> dict[str, dt.date]:
+    if not line_dfs:
+        return {}
+    if date_arg:
+        fixed_date = pd.to_datetime(date_arg).date()
+        return {label: fixed_date for label in line_dfs}
+    mode = (date_mode or "per-line").strip().lower()
+    if mode == "global":
+        global_date = pick_date_from_dfs(line_dfs.values(), None)
+        return {label: global_date for label in line_dfs}
+    return {label: pick_date_from_dfs([df], None) for label, df in line_dfs.items()}
+
+
+def validate_sheet_data(df: pd.DataFrame, auto_fix: bool = False) -> dict[str, Any]:
+    out_df = df.copy()
+    issues: list[dict[str, Any]] = []
+    fixed_count = 0
+
+    rules = [
+        {"type": "首效超范围", "token": "0.1C首效", "lower": 0.0, "upper": 100.0, "auto_fix": True},
+        {"type": "成品压实超范围", "token": "成品压实", "lower": 1.5, "upper": 4.0, "auto_fix": False},
+        {"type": "比表超范围", "token": "麦克比表", "lower": 0.0, "upper": 30.0, "auto_fix": False},
+        {"type": "Li+超范围", "token": "Li+含量", "lower": 0.0, "upper": 1.0, "auto_fix": False},
+        {"type": "粉阻超范围", "token": "粉末电阻", "lower": 0.0, "upper": 200.0, "auto_fix": False},
+        {"type": "碳含量超范围", "token": "碳含量", "lower": 0.0, "upper": 10.0, "auto_fix": False},
+    ]
+
+    for rule in rules:
+        cols = [c for c in out_df.columns if _col_contains(c, str(rule["token"]))]
+        if not cols:
+            continue
+        lower = float(rule["lower"])
+        upper = float(rule["upper"])
+        for col in cols:
+            values = _to_num_series(out_df[col])
+            bad_mask = values.notna() & ((values < lower) | (values > upper))
+            if not bad_mask.any():
+                continue
+
+            for idx in out_df.index[bad_mask]:
+                parsed = float(values.loc[idx])
+                raw_value = out_df.at[idx, col]
+                source_date = out_df.at[idx, "投料日期"] if "投料日期" in out_df.columns else None
+                source_batch = out_df.at[idx, "批次"] if "批次" in out_df.columns else None
+
+                suggested_value: Optional[float] = None
+                fixed = False
+                if bool(rule["auto_fix"]) and auto_fix and float(parsed).is_integer() and 100 < parsed <= 10000:
+                    suggested_value = parsed / 100.0
+                    out_df.at[idx, col] = suggested_value
+                    fixed = True
+                    fixed_count += 1
+
+                issues.append(
+                    {
+                        "类型": str(rule["type"]),
+                        "列名": col,
+                        "索引": int(idx),
+                        "原始值": raw_value,
+                        "解析值": parsed,
+                        "建议值": suggested_value,
+                        "投料日期": source_date if isinstance(source_date, dt.date) else None,
+                        "批次": _norm_cell(source_batch),
+                        "已自动修正": fixed,
+                        "quality_flags": [str(rule["type"])],
+                    }
+                )
+
+    return {"df": out_df, "issues": issues, "fixed_count": fixed_count}
+
+
+def _quality_issue_to_text(issue: dict[str, Any], line_label: Optional[str] = None) -> str:
+    date_part = issue.get("投料日期")
+    date_text = date_part.strftime("%Y.%m.%d") if isinstance(date_part, dt.date) else "未知日期"
+    batch_text = issue.get("批次") or "批次未知"
+    col_text = str(issue.get("列名") or "未知列")
+    value_text = str(issue.get("原始值"))
+    line_prefix = f"{line_label} " if line_label else ""
+    fix_hint = ""
+    if issue.get("已自动修正") and issue.get("建议值") is not None:
+        fix_hint = f"（已按{issue['建议值']:.2f}修正）"
+    elif issue.get("建议值") is not None:
+        fix_hint = f"（建议{issue['建议值']:.2f}）"
+    return f"{line_prefix}{date_text} {batch_text} {col_text}={value_text}{fix_hint}"
+
+
 def _merge_stats(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     if not a.get("有数据") and not b.get("有数据"):
-        return {"有数据": False}
+        if _stat_state(a) == STAT_UNCONFIGURED and _stat_state(b) == STAT_UNCONFIGURED:
+            return {"有数据": False, "状态": STAT_UNCONFIGURED}
+        return {"有数据": False, "状态": STAT_NO_DATA}
 
     mins: list[float] = []
     maxs: list[float] = []
@@ -822,6 +1420,7 @@ def _merge_stats(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     mean = sum(m * n for m, n in zip(means, ns)) / total_n if total_n else float("nan")
     return {
         "有数据": True,
+        "状态": STAT_HAS_DATA,
         "min": float(min(mins)),
         "max": float(max(maxs)),
         "mean": float(mean),
@@ -830,7 +1429,10 @@ def _merge_stats(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
 
 
 def _fmt_range(stat: dict[str, Any], decimals: int = 3) -> str:
-    if not stat.get("有数据"):
+    state = _stat_state(stat)
+    if state == STAT_UNCONFIGURED:
+        return STAT_UNCONFIGURED_TEXT
+    if not _state_has_data(state):
         return "未找到有效数据"
     mn = float(stat["min"])
     mx = float(stat["max"])
@@ -840,46 +1442,67 @@ def _fmt_range(stat: dict[str, Any], decimals: int = 3) -> str:
 
 
 def _fmt_status(stat: dict[str, Any], force: bool = False) -> str:
-    judge = stat.get("判异") if isinstance(stat, dict) else None
-    if not isinstance(judge, dict):
-        if force and stat.get("有数据"):
-            return "（未设定口径）"
+    state = _stat_state(stat)
+    if not _state_has_data(state):
         return ""
-    abnormal = judge.get("异常")
-    batch_judge = stat.get("批次判异") if isinstance(stat, dict) else None
-    if abnormal is True and isinstance(batch_judge, dict):
-        total = int(batch_judge.get("总批次", 0))
-        abnormal_cnt = int(batch_judge.get("异常批次", 0))
-        if total > 0 and abnormal_cnt > 0:
-            low_cnt = int(batch_judge.get("低于下限批次", 0))
-            high_cnt = int(batch_judge.get("高于上限批次", 0))
-            direction_parts: list[str] = []
-            if low_cnt > 0:
-                direction_parts.append("低于下限")
-            if high_cnt > 0:
-                direction_parts.append("高于上限")
-            direction = f"，{'/'.join(direction_parts)}" if direction_parts else ""
-            return f"（异常，{abnormal_cnt}/{total}批次超规{direction}）"
-    if abnormal is True:
-        return "（异常）"
-    if abnormal is False:
-        return "（正常）"
-    return ""
+    parts: list[str] = []
+
+    if _spec_health_is_suspect(stat):
+        parts.append(_spec_health_text(stat))
+    else:
+        judge = stat.get("判异") if isinstance(stat, dict) else None
+        if not isinstance(judge, dict):
+            if force and stat.get("有数据"):
+                parts.append("未设定口径")
+        else:
+            abnormal = judge.get("异常")
+            batch_judge = stat.get("批次判异") if isinstance(stat, dict) else None
+            if abnormal is True and isinstance(batch_judge, dict):
+                total = int(batch_judge.get("总批次", 0))
+                abnormal_cnt = int(batch_judge.get("异常批次", 0))
+                if total > 0 and abnormal_cnt > 0:
+                    low_cnt = int(batch_judge.get("低于下限批次", 0))
+                    high_cnt = int(batch_judge.get("高于上限批次", 0))
+                    direction_parts: list[str] = []
+                    if low_cnt > 0:
+                        direction_parts.append("低于下限")
+                    if high_cnt > 0:
+                        direction_parts.append("高于上限")
+                    direction = f"，{'/'.join(direction_parts)}" if direction_parts else ""
+                    parts.append(f"异常，{abnormal_cnt}/{total}批次超规{direction}")
+                else:
+                    parts.append("异常")
+            elif abnormal is True:
+                parts.append("异常")
+            elif abnormal is False:
+                parts.append("正常")
+
+    if state == STAT_STALE:
+        lag_days = int(stat.get("lag_days", 0))
+        parts.append(f"滞后{lag_days}天")
+
+    if not parts:
+        return ""
+    return f"（{'；'.join([p for p in parts if p])}）"
 
 
 def _fmt_source_date(stat: dict[str, Any]) -> str:
+    if not _state_has_data(_stat_state(stat)):
+        return ""
     d = stat.get("来源日期")
-    if isinstance(d, dt.date) and not stat.get("是否当日", False):
-        date_str = d.strftime("%Y.%m.%d")
-        batch_summary = stat.get("来源批次摘要")
-        if isinstance(batch_summary, str) and batch_summary:
-            return f"（{date_str}投料批次{batch_summary}）"
-        return f"（{date_str}投料批次未知）"
-    return ""
+    if not isinstance(d, dt.date):
+        return ""
+    date_str = d.strftime("%Y.%m.%d")
+    lag_days = int(stat.get("lag_days", 0))
+    lag_text = "当日" if lag_days <= 0 else f"滞后{lag_days}天"
+    batch_summary = stat.get("来源批次摘要")
+    if isinstance(batch_summary, str) and batch_summary:
+        return f"（来源{date_str}，{lag_text}，投料批次{batch_summary}）"
+    return f"（来源{date_str}，{lag_text}，投料批次未知）"
 
 
 def _with_unit(value: str, unit: str) -> str:
-    return value if value == "未找到有效数据" else f"{value}{unit}"
+    return value if value in ("未找到有效数据", STAT_UNCONFIGURED_TEXT) else f"{value}{unit}"
 
 
 def _fmt_metric(stat: dict[str, Any], decimals: int, force_status: bool = False) -> str:
@@ -887,7 +1510,7 @@ def _fmt_metric(stat: dict[str, Any], decimals: int, force_status: bool = False)
 
 
 def _fmt_li_status(stat: dict[str, Any]) -> str:
-    if not stat.get("有数据"):
+    if not _state_has_data(_stat_state(stat)):
         return ""
     return "（合格）" if float(stat["max"]) < _LI_PASS_MAX else "（超标）"
 
@@ -944,7 +1567,10 @@ def _trend_significant(trend: dict[str, Any], rel_threshold: float, abs_threshol
 
 
 def _fmt_trend_brief(trend: dict[str, Any], decimals: int, unit: str = "") -> str:
-    if not trend.get("有数据"):
+    state = _stat_state(trend)
+    if state == STAT_UNCONFIGURED:
+        return STAT_UNCONFIGURED_TEXT
+    if not _state_has_data(state):
         return "无数据"
     means = trend.get("均值") or []
     if not means:
@@ -976,7 +1602,10 @@ def _fmt_trend_layered(
 
 
 def _fmt_trend(trend: dict[str, Any], decimals: int, unit: str = "") -> str:
-    if not trend.get("有数据"):
+    state = _stat_state(trend)
+    if state == STAT_UNCONFIGURED:
+        return STAT_UNCONFIGURED_TEXT
+    if not _state_has_data(state):
         return "无数据"
     means = trend.get("均值") or []
     if not means:
@@ -1123,7 +1752,12 @@ def build_wecom_text(report_date: dt.date, a: dict[str, Any], b: dict[str, Any])
 
 
 def build_wecom_text_single(
-    report_date: dt.date, metrics: dict[str, Any], line_label: str, model: str, enable_spec: bool = True
+    report_date: dt.date,
+    metrics: dict[str, Any],
+    line_label: str,
+    model: str,
+    enable_spec: bool = True,
+    quality_issues: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     date_str = report_date.strftime("%Y.%m.%d")
 
@@ -1222,6 +1856,13 @@ def build_wecom_text_single(
         lines.append(f"    碳含量 {carbon_trend}。")
         lines.append(f"    粉阻(粉末电阻) {powder_trend}。")
         lines.append(f"    比表(麦克比表) {bet_trend}。")
+
+    if quality_issues:
+        lines.append(f"  数据质量告警：{len(quality_issues)}项。")
+        for issue in quality_issues[:5]:
+            lines.append(f"    - {_quality_issue_to_text(issue)}")
+        if len(quality_issues) > 5:
+            lines.append(f"    - 其余{len(quality_issues) - 5}项省略。")
 
     lines.append("5、下一步计划：本次Excel未包含（可从模板/手工输入/第二张表接入）")
     lines.append("6、工艺验证：本次Excel未包含（待接入第二张表/Sheet）")
@@ -1400,6 +2041,8 @@ _LEADER_KEY_METRICS: list[tuple[str, str, int, str]] = [
 def _stat_is_abnormal(stat: Any) -> bool:
     if not isinstance(stat, dict):
         return False
+    if _spec_health_is_suspect(stat):
+        return False
     judge = stat.get("判异")
     return isinstance(judge, dict) and bool(judge.get("异常") is True)
 
@@ -1451,29 +2094,55 @@ def build_wecom_text_leader(line_reports: list[dict[str, Any]]) -> str:
         date_str = "/".join(d.strftime("%Y.%m.%d") for d in date_set) if date_set else dt.date.today().strftime("%Y.%m.%d")
 
     abnormal_items: list[str] = []
+    spec_attention_items: list[str] = []
     key_metric_lines: list[str] = []
+    quality_items: list[str] = []
     for r in valid_reports:
         line_label = str(r["line_label"])
         metrics = r["metrics"]
         key_metric_lines.append(_leader_key_metric_line(line_label, metrics))
         for section, key in _LEADER_ABNORMAL_KEYS:
             st = metrics.get(section, {}).get(key)
-            if _stat_is_abnormal(st):
+            if _spec_health_is_suspect(st):
+                spec_attention_items.append(f"{line_label} {key}")
+            elif _stat_is_abnormal(st):
                 abnormal_items.append(f"{line_label} {key}（{_stat_source_batch_text(st)}）")
+        for issue in r.get("quality_issues", []) if isinstance(r.get("quality_issues"), list) else []:
+            if isinstance(issue, dict):
+                quality_items.append(_quality_issue_to_text(issue, line_label=line_label))
 
     abnormal_items = list(dict.fromkeys(abnormal_items))
+    spec_attention_items = list(dict.fromkeys(spec_attention_items))
+    quality_items = list(dict.fromkeys(quality_items))
     if abnormal_items:
         conclusion = f"关注（{len(abnormal_items)}项异常）"
         abnormal_text = "；".join(abnormal_items)
+        if spec_attention_items:
+            abnormal_text += f"；治理关注（{len(spec_attention_items)}项口径疑似）：" + "；".join(spec_attention_items[:3])
+            if len(spec_attention_items) > 3:
+                abnormal_text += f"；其余{len(spec_attention_items) - 3}项省略"
+    elif spec_attention_items:
+        conclusion = f"治理关注（{len(spec_attention_items)}项口径疑似）"
+        abnormal_text = "；".join(spec_attention_items[:3])
+        if len(spec_attention_items) > 3:
+            abnormal_text += f"；其余{len(spec_attention_items) - 3}项省略"
     else:
         conclusion = "正常"
         abnormal_text = "无"
+
+    if quality_items:
+        quality_text = f"共{len(quality_items)}项；" + "；".join(quality_items[:3])
+        if len(quality_items) > 3:
+            quality_text += f"；其余{len(quality_items) - 3}项省略"
+    else:
+        quality_text = "无"
 
     key_metric_text = "；".join([x for x in key_metric_lines if x]) if key_metric_lines else "无"
     lines = [
         f"1、今日结论（{date_str}）：{conclusion}",
         f"2、异常项清单：{abnormal_text}",
         f"3、关键指标区间：{key_metric_text}",
+        f"4、数据质量告警：{quality_text}",
     ]
     return "\n".join(lines)
 
@@ -1483,13 +2152,31 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="从Excel生成企业微信日报文本（制程/成品）。")
     parser.add_argument("--excel", default=None, help="Excel路径；默认匹配当前目录下 *.xlsx")
-    parser.add_argument("--sheet", default=None, help="指定要生成日报的工作表名（如 S18-B线、S006-B线）")
+    parser.add_argument("--sheet", default=None, help="指定要生成日报的工作表名（可逗号分隔多张，如 S18-B线,S006-B线）")
     parser.add_argument("--model", default=None, choices=["S18", "S006"], help="按产品型号筛选工作表")
     parser.add_argument("--list-sheets", action="store_true", help="仅列出工作簿中的候选线别并退出")
     parser.add_argument("--date", default=None, help="日期：YYYY-MM-DD；默认取表内最新投料日期")
+    parser.add_argument(
+        "--date-mode",
+        default="per-line",
+        choices=["per-line", "global"],
+        help="日期策略：per-line按线独立日期（默认），global全线统一日期",
+    )
     parser.add_argument("--lookback-days", type=int, default=7, help="指标取数向前回溯天数（避免当日某列为空显示“未录入”）")
     parser.add_argument("--trend-days", type=int, default=7, help="趋势窗口（近N次有数）；设为0可关闭")
     parser.add_argument("--disable-trend", action="store_true", help="关闭趋势窗口分析")
+    parser.add_argument("--show-skipped-sheets", action="store_true", help="输出被跳过的工作表及原因")
+    parser.add_argument("--stale-threshold-process", type=int, default=2, help="制程指标滞后阈值（天）")
+    parser.add_argument("--stale-threshold-product", type=int, default=3, help="成品物性指标滞后阈值（天）")
+    parser.add_argument("--stale-threshold-electrochem", type=int, default=5, help="电化学指标滞后阈值（天）")
+    parser.add_argument(
+        "--spec-registry",
+        default=DEFAULT_SPEC_REGISTRY_PATH,
+        help=f"规格配置文件路径（默认 {DEFAULT_SPEC_REGISTRY_PATH}；配置优先于列名解析）",
+    )
+    parser.add_argument("--spec-health-window", type=int, default=14, help="口径健康判定窗口（近N个有数日期）")
+    parser.add_argument("--spec-health-threshold", type=float, default=0.4, help="口径健康判定异常占比阈值")
+    parser.add_argument("--auto-fix-quality", action="store_true", help="自动修正明显首效录入异常（如 9781 -> 97.81）")
     parser.add_argument("--out", default=None, help="输出到文件（UTF-8）；不填则打印到控制台")
     args = parser.parse_args()
 
@@ -1502,76 +2189,139 @@ def main() -> int:
         path = matches[0]
 
     all_sheets = list_workbook_sheets(path)
-    line_sheets = list_line_sheets(path)
+    line_sheets, skipped_sheets = list_line_sheets_with_skipped(path)
 
     if args.list_sheets:
         if not line_sheets:
             print("未识别到可用线别工作表。")
+            if args.show_skipped_sheets and skipped_sheets:
+                print("被跳过工作表：")
+                for name, reason in skipped_sheets.items():
+                    print(f"- {name}: {reason}")
             return 0
         print("候选线别工作表：")
         for s in line_sheets:
             model = detect_model_from_sheet(s)
             print(f"- {s} (model={model})")
+        if args.show_skipped_sheets and skipped_sheets:
+            print("被跳过工作表：")
+            for name, reason in skipped_sheets.items():
+                print(f"- {name}: {reason}")
         return 0
 
     if not line_sheets:
-        raise ValueError(f"未识别到可用线别工作表：{path}")
+        detail = "；".join([f"{k}:{v}" for k, v in skipped_sheets.items()]) if skipped_sheets else "无可用线别"
+        raise ValueError(f"未识别到可用线别工作表：{path}（{detail}）")
 
-    target_sheet: Optional[str] = None
+    selected_sheets: list[str] = []
     if args.sheet:
-        if args.sheet not in all_sheets:
-            raise ValueError(f"工作表不存在：{args.sheet}，可选：{', '.join(all_sheets)}")
+        selected_sheets = [s.strip() for s in str(args.sheet).split(",") if s.strip()]
+        if not selected_sheets:
+            raise ValueError("--sheet 不能为空")
+        missing = [s for s in selected_sheets if s not in all_sheets]
+        if missing:
+            raise ValueError(f"工作表不存在：{', '.join(missing)}；可选：{', '.join(all_sheets)}")
         if args.model:
-            sheet_model = detect_model_from_sheet(args.sheet)
-            if sheet_model != "UNKNOWN" and sheet_model != args.model:
-                raise ValueError(
-                    f"工作表 {args.sheet} 的型号为 {sheet_model}，与 --model {args.model} 不一致"
-                )
-        target_sheet = args.sheet
+            mismatch = [
+                s
+                for s in selected_sheets
+                if detect_model_from_sheet(s) not in (args.model, "UNKNOWN")
+            ]
+            if mismatch:
+                detail = ", ".join([f"{s}({detect_model_from_sheet(s)})" for s in mismatch])
+                raise ValueError(f"以下工作表与 --model {args.model} 不一致：{detail}")
     else:
-        candidates = line_sheets
+        selected_sheets = list(line_sheets)
         if args.model:
-            candidates = [s for s in candidates if detect_model_from_sheet(s) == args.model]
-            if not candidates:
-                available = ", ".join([f"{s}({detect_model_from_sheet(s)})" for s in line_sheets])
+            selected_sheets = [s for s in selected_sheets if detect_model_from_sheet(s) == args.model]
+            if not selected_sheets:
+                available = ", ".join([f"{s}({detect_model_from_sheet(s)})" for s in line_sheets]) or "无"
                 raise ValueError(f"未找到型号为 {args.model} 的候选线别；现有：{available}")
-        for s in candidates:
-            try:
-                _ = load_sheet_table(path, s)
-                target_sheet = s
-                break
-            except Exception:
-                continue
-        if target_sheet is None:
-            raise ValueError(f"候选线别均无法读取：{', '.join(candidates)}")
-
-    assert target_sheet is not None
-
-    df = load_sheet_table(path, target_sheet)
 
     trend_days = 0 if args.disable_trend else max(0, int(args.trend_days))
-    detected_model = detect_model_from_sheet(target_sheet)
-    model = detected_model if detected_model != "UNKNOWN" else (args.model or detected_model)
-    profile = PRODUCT_SPEC_PROFILES.get(model, get_profile_for_sheet(target_sheet))
-
-    report_date = pick_date_from_dfs([df], args.date)
-    metrics = extract_metrics(df, report_date, args.lookback_days, trend_days, enable_spec=profile.enable_spec)
-    detail_text = build_wecom_text_single(
-        report_date=report_date,
-        metrics=metrics,
-        line_label=target_sheet,
-        model=model,
-        enable_spec=profile.enable_spec,
+    stale_cfg = StaleThresholdConfig(
+        process_days=max(0, int(args.stale_threshold_process)),
+        product_days=max(0, int(args.stale_threshold_product)),
+        electrochem_days=max(0, int(args.stale_threshold_electrochem)),
     )
-    line_report = {
-        "line_label": target_sheet,
-        "report_date": report_date,
-        "model": model,
-        "enable_spec": profile.enable_spec,
-        "metrics": metrics,
-    }
-    leader_text = build_wecom_text_leader([line_report])
+    spec_health_cfg = SpecHealthConfig(
+        enabled=True,
+        window_days=max(1, int(args.spec_health_window)),
+        abnormal_ratio_threshold=max(0.0, min(1.0, float(args.spec_health_threshold))),
+        min_consecutive_days=5,
+    )
+    spec_registry_rules = load_spec_registry(args.spec_registry)
+    if args.spec_registry and not spec_registry_rules and not os.path.exists(args.spec_registry):
+        print(f"规格配置文件不存在：{args.spec_registry}（将回退列名解析）", file=sys.stderr)
+
+    line_dfs: dict[str, pd.DataFrame] = {}
+    line_errors: list[str] = []
+    for sheet_name in selected_sheets:
+        try:
+            line_dfs[sheet_name] = load_sheet_table(path, sheet_name)
+        except Exception as e:
+            line_errors.append(f"{sheet_name}: {e}")
+
+    if not line_dfs:
+        raise ValueError("所选线别全部读取失败：" + "；".join(line_errors))
+
+    report_dates = resolve_report_dates(line_dfs, args.date, args.date_mode)
+
+    line_reports: list[dict[str, Any]] = []
+    for sheet_name, df in line_dfs.items():
+        detected_model = detect_model_from_sheet(sheet_name)
+        model = detected_model if detected_model != "UNKNOWN" else (args.model or detected_model)
+        profile = PRODUCT_SPEC_PROFILES.get(model, get_profile_for_sheet(sheet_name))
+
+        quality = validate_sheet_data(df, auto_fix=args.auto_fix_quality)
+        df_for_metrics = quality["df"]
+        report_date = report_dates[sheet_name]
+        metrics = extract_metrics(
+            df_for_metrics,
+            report_date,
+            args.lookback_days,
+            trend_days,
+            enable_spec=profile.enable_spec,
+            line_label=sheet_name,
+            model=model,
+            stale_thresholds=stale_cfg,
+            spec_registry=spec_registry_rules,
+            spec_health=spec_health_cfg,
+        )
+        line_reports.append(
+            {
+                "line_label": sheet_name,
+                "report_date": report_date,
+                "model": model,
+                "enable_spec": profile.enable_spec,
+                "metrics": metrics,
+                "quality_issues": quality["issues"],
+                "quality_fixed_count": int(quality["fixed_count"]),
+            }
+        )
+
+    if len(line_reports) == 1:
+        r = line_reports[0]
+        detail_text = build_wecom_text_single(
+            report_date=r["report_date"],
+            metrics=r["metrics"],
+            line_label=r["line_label"],
+            model=r.get("model", "UNKNOWN"),
+            enable_spec=bool(r.get("enable_spec", True)),
+            quality_issues=r.get("quality_issues"),
+        )
+    else:
+        detail_text = build_wecom_text_multi(line_reports)
+
+    leader_text = build_wecom_text_leader(line_reports)
     text = leader_text if not detail_text else (leader_text + "\n\n【工程版】\n" + detail_text)
+
+    if line_errors:
+        print("部分线别读取失败：" + "；".join(line_errors), file=sys.stderr)
+    if args.show_skipped_sheets and skipped_sheets:
+        print("被跳过工作表：", file=sys.stderr)
+        for name, reason in skipped_sheets.items():
+            print(f"- {name}: {reason}", file=sys.stderr)
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
